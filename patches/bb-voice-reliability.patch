@@ -1,5 +1,5 @@
 diff --git a/apps/app/src/components/promptbox/FailedVoiceRecordings.tsx b/apps/app/src/components/promptbox/FailedVoiceRecordings.tsx
-index ac45a09fa..b1ad8937d 100644
+index ac45a09fa..eda6d557c 100644
 --- a/apps/app/src/components/promptbox/FailedVoiceRecordings.tsx
 +++ b/apps/app/src/components/promptbox/FailedVoiceRecordings.tsx
 @@ -38,12 +38,12 @@ export function FailedVoiceRecordings({
@@ -43,16 +43,20 @@ index ac45a09fa..b1ad8937d 100644
                </Tooltip>
                <div className="col-start-2 flex items-center gap-1 pb-0.5 md:contents">
                  <Button
-@@ -88,7 +88,7 @@ export function FailedVoiceRecordings({
+@@ -88,7 +88,11 @@ export function FailedVoiceRecordings({
                      recording.retrying && "disabled:opacity-100",
                    )}
                  >
 -                  {recording.retrying ? "Retrying…" : "Retry"}
-+                  {recording.retrying ? "Расшифровываю…" : "Повторить"}
++                  {recording.transcript
++                    ? "Вставить текст"
++                    : recording.retrying
++                      ? "Расшифровываю…"
++                      : "Повторить"}
                  </Button>
                  <Button
                    type="button"
-@@ -97,7 +97,7 @@ export function FailedVoiceRecordings({
+@@ -97,7 +101,7 @@ export function FailedVoiceRecordings({
                    onClick={() => onDownload(recording)}
                    className={cn(ACTION_BUTTON_CLASS, "text-muted-foreground")}
                  >
@@ -61,8 +65,245 @@ index ac45a09fa..b1ad8937d 100644
                  </Button>
                </div>
              </div>
+diff --git a/apps/app/src/components/promptbox/usePromptVoice.ts b/apps/app/src/components/promptbox/usePromptVoice.ts
+index b684f5c30..28e0e32fc 100644
+--- a/apps/app/src/components/promptbox/usePromptVoice.ts
++++ b/apps/app/src/components/promptbox/usePromptVoice.ts
+@@ -73,6 +73,7 @@ export function usePromptVoice(
+       microphoneWarning: voiceInput.microphoneWarning,
+       isSupported: voiceInput.isSupported,
+       stream: voiceInput.stream,
++      liveText: voiceInput.liveText,
+       failedRecordings: voiceInput.failedRecordings,
+       start: voiceInput.start,
+       stop,
+@@ -88,6 +89,7 @@ export function usePromptVoice(
+       voiceInput.microphoneWarning,
+       voiceInput.isSupported,
+       voiceInput.stream,
++      voiceInput.liveText,
+       voiceInput.failedRecordings,
+       voiceInput.start,
+       stop,
+diff --git a/apps/app/src/components/thread/user-questions/QuestionForm.test.tsx b/apps/app/src/components/thread/user-questions/QuestionForm.test.tsx
+index f8c59cb16..d49ae3313 100644
+--- a/apps/app/src/components/thread/user-questions/QuestionForm.test.tsx
++++ b/apps/app/src/components/thread/user-questions/QuestionForm.test.tsx
+@@ -41,6 +41,7 @@ beforeEach(() => {
+     isProcessing: false,
+     isListening: false,
+     delivery: "insert",
++    liveText: "",
+     failedRecordings: [],
+     start: vi.fn(async () => {}),
+     stop: vi.fn(),
+diff --git a/apps/app/src/hooks/useVoiceInput.live.test.tsx b/apps/app/src/hooks/useVoiceInput.live.test.tsx
+new file mode 100644
+index 000000000..cbbc17413
+--- /dev/null
++++ b/apps/app/src/hooks/useVoiceInput.live.test.tsx
+@@ -0,0 +1,199 @@
++// @vitest-environment jsdom
++
++import { act, cleanup, renderHook } from "@testing-library/react";
++import { afterEach, beforeEach, expect, it, vi } from "vitest";
++import { useVoiceInput } from "./useVoiceInput";
++
++const live = vi.hoisted(() => ({
++  finish: vi.fn(),
++  push: vi.fn(),
++  abort: vi.fn(),
++  onText: null as null | ((text: string) => void),
++  timings: [] as Record<string, unknown>[],
++}));
++
++vi.mock("@/components/ui/app-toast", () => ({ appToast: { error: vi.fn() } }));
++vi.mock("@/lib/save-file", () => ({ saveFile: vi.fn() }));
++vi.mock("@/lib/audio-input-device-preference", () => ({
++  useAudioInputDevicePreferenceValue: vi.fn(() => null),
++  requestAudioInputStream: (mediaDevices: MediaDevices) =>
++    mediaDevices.getUserMedia({ audio: true }),
++}));
++vi.mock("@/lib/microphone-recording-stream", () => ({
++  createMicrophoneRecordingStream: (input: MediaStream) => ({
++    stream: input,
++    resume: async () => {},
++    tapPcm: (onSamples: (samples: Float32Array, rate: number) => void) => {
++      onSamples(new Float32Array(4096), 48_000);
++      return true;
++    },
++    replace: vi.fn(),
++    close: vi.fn(),
++  }),
++}));
++vi.mock("@/lib/voice-live", () => ({
++  isLiveVoiceEnabled: () => true,
++  reportVoiceTiming: (timing: Record<string, unknown>) =>
++    live.timings.push(timing),
++  startLiveTranscription: (options: { onText: (text: string) => void }) => {
++    live.onText = options.onText;
++    return { push: live.push, finish: live.finish, abort: live.abort };
++  },
++}));
++
++class Recorder {
++  static isTypeSupported = () => true;
++  mimeType = "audio/webm";
++  state = "inactive";
++  onstart = () => {};
++  ondataavailable = (_event: { data: Blob }) => {};
++  onstop = async () => {};
++  start() {
++    this.state = "recording";
++    this.onstart();
++  }
++  stop() {
++    this.state = "inactive";
++    this.ondataavailable({ data: new Blob(["recorded audio"]) });
++    return this.onstop();
++  }
++}
++
++beforeEach(() => {
++  vi.useFakeTimers();
++  vi.stubGlobal("MediaRecorder", Recorder);
++  const node = () => ({
++    connect: vi.fn(),
++    disconnect: vi.fn(),
++    getByteTimeDomainData: vi.fn(),
++    getFloatTimeDomainData: vi.fn(),
++    fftSize: 2048,
++  });
++  vi.stubGlobal(
++    "AudioContext",
++    class {
++      state = "running";
++      sampleRate = 48_000;
++      createAnalyser = node;
++      createMediaStreamSource = node;
++      resume = async () => {};
++      close = async () => {};
++    },
++  );
++  vi.stubGlobal("navigator", {
++    mediaDevices: {
++      getUserMedia: vi.fn().mockResolvedValue({
++        getTracks: () => [{ stop: vi.fn() }],
++        getAudioTracks: () => [],
++      }),
++    },
++  });
++  live.timings = [];
++});
++
++afterEach(() => {
++  cleanup();
++  vi.useRealTimers();
++  vi.unstubAllGlobals();
++  vi.clearAllMocks();
++});
++
++it("shows words while speaking and inserts the live text without a batch upload", async () => {
++  live.finish.mockResolvedValue({
++    ok: true,
++    text: "Оплатить 43 500 рублей",
++    model: "scribe_v3_live",
++  });
++  const onTranscribe = vi.fn();
++  const onTranscript = vi.fn();
++  const { result } = renderHook(() =>
++    useVoiceInput({ recordingKey: "thread/live", onTranscribe, onTranscript }),
++  );
++  await act(() => result.current.start());
++  expect(live.push).toHaveBeenCalled();
++  act(() => live.onText?.("Оплатить 43"));
++  expect(result.current.liveText).toBe("Оплатить 43");
++  vi.advanceTimersByTime(1500);
++  await act(async () => result.current.stop("send"));
++  await act(() => vi.advanceTimersByTimeAsync(10));
++  expect(onTranscribe).not.toHaveBeenCalled();
++  expect(onTranscript).toHaveBeenCalledExactlyOnceWith(
++    "Оплатить 43 500 рублей",
++    "send",
++  );
++  expect(result.current.liveText).toBe("");
++  expect(result.current.failedRecordings).toEqual([]);
++  expect(live.timings[0]).toMatchObject({
++    path: "live",
++    model: "scribe_v3_live",
++    outcome: "transcript",
++  });
++});
++
++it("falls back to the saved recording when live transcription fails", async () => {
++  live.finish.mockResolvedValue({ ok: false, reason: "socket error" });
++  const onTranscribe = vi.fn().mockResolvedValue("Из записи");
++  const onTranscript = vi.fn();
++  const { result } = renderHook(() =>
++    useVoiceInput({
++      recordingKey: "thread/live-fallback",
++      onTranscribe,
++      onTranscript,
++    }),
++  );
++  await act(() => result.current.start());
++  vi.advanceTimersByTime(1500);
++  await act(async () => result.current.stop("insert"));
++  await act(() => vi.advanceTimersByTimeAsync(10));
++  expect(onTranscribe).toHaveBeenCalledOnce();
++  expect(onTranscript).toHaveBeenCalledExactlyOnceWith("Из записи", "insert");
++  expect(live.timings[0]).toMatchObject({
++    path: "batch",
++    liveFailure: "socket error",
++  });
++});
++
++it("keeps the finished text when inserting it fails, and inserts it later without transcribing again", async () => {
++  live.finish.mockResolvedValue({ ok: true, text: "Готовый текст", model: "m" });
++  const onTranscribe = vi.fn();
++  const onTranscript = vi
++    .fn()
++    .mockRejectedValueOnce(new Error("composer gone"))
++    .mockResolvedValueOnce(undefined);
++  const { result } = renderHook(() =>
++    useVoiceInput({
++      recordingKey: "thread/live-insert-failed",
++      onTranscribe,
++      onTranscript,
++    }),
++  );
++  await act(() => result.current.start());
++  vi.advanceTimersByTime(1500);
++  await act(async () => result.current.stop("insert"));
++  await act(() => vi.advanceTimersByTimeAsync(10));
++  const [saved] = result.current.failedRecordings;
++  expect(saved).toMatchObject({
++    transcript: "Готовый текст",
++    errorMessage: "Текст готов — нажмите «Вставить»",
++  });
++  if (!saved) throw new Error("missing saved text");
++  await act(async () => result.current.retry(saved));
++  await act(() => vi.advanceTimersByTimeAsync(10));
++  expect(onTranscribe).not.toHaveBeenCalled();
++  expect(onTranscript).toHaveBeenLastCalledWith("Готовый текст", "insert");
++  expect(result.current.failedRecordings).toEqual([]);
++});
++
++it("stops live transcription when the user cancels the recording", async () => {
++  const { result } = renderHook(() =>
++    useVoiceInput({
++      recordingKey: "thread/live-cancel",
++      onTranscribe: vi.fn(),
++      onTranscript: vi.fn(),
++    }),
++  );
++  await act(() => result.current.start());
++  await act(async () => result.current.cancel());
++  expect(live.abort).toHaveBeenCalled();
++  expect(live.finish).not.toHaveBeenCalled();
++});
 diff --git a/apps/app/src/hooks/useVoiceInput.test.tsx b/apps/app/src/hooks/useVoiceInput.test.tsx
-index 8c459800d..051a027ff 100644
+index 8c459800d..1c67763ad 100644
 --- a/apps/app/src/hooks/useVoiceInput.test.tsx
 +++ b/apps/app/src/hooks/useVoiceInput.test.tsx
 @@ -3,6 +3,7 @@
@@ -158,6 +399,15 @@ index 8c459800d..051a027ff 100644
        .mockImplementationOnce(
          () =>
            new Promise<string>((resolve) => {
+@@ -267,7 +290,7 @@ it.each([false, true])(
+   },
+ );
+ 
+-it("delivers a live transcript after the completion transition, but never animates a retry", async () => {
++it("delivers a live transcript without waiting for the completion transition, and never animates a retry", async () => {
+   let finishTransition: (() => void) | undefined;
+   const playCompletionTransition = vi.fn(
+     () =>
 @@ -278,7 +301,7 @@ it("delivers a live transcript after the completion transition, but never animat
    const transcribe = vi
      .fn()
@@ -167,7 +417,18 @@ index 8c459800d..051a027ff 100644
      .mockResolvedValueOnce("Retried words");
    const onTranscript = vi.fn();
    const { result } = renderHook(() =>
-@@ -307,24 +330,94 @@ it("delivers a live transcript after the completion transition, but never animat
+@@ -293,9 +316,8 @@ it("delivers a live transcript after the completion transition, but never animat
+   vi.advanceTimersByTime(1500);
+   await act(async () => result.current.stop("insert"));
+   expect(playCompletionTransition).toHaveBeenCalledOnce();
+-  expect(onTranscript).not.toHaveBeenCalled();
+-  await act(async () => finishTransition?.());
+   expect(onTranscript).toHaveBeenCalledExactlyOnceWith("Live words", "insert");
++  await act(async () => finishTransition?.());
+ 
+   await act(() => result.current.start());
+   vi.advanceTimersByTime(1500);
+@@ -307,24 +329,94 @@ it("delivers a live transcript after the completion transition, but never animat
    expect(playCompletionTransition).toHaveBeenCalledOnce();
  });
  
@@ -267,7 +528,7 @@ index 8c459800d..051a027ff 100644
  it("tells the user where a recording went when it fails after its composer unmounts", async () => {
    let failTranscription: ((error: Error) => void) | undefined;
    const onTranscribe = vi.fn(
-@@ -343,11 +436,15 @@ it("tells the user where a recording went when it fails after its composer unmou
+@@ -343,11 +435,15 @@ it("tells the user where a recording went when it fails after its composer unmou
    vi.advanceTimersByTime(1500);
    await act(async () => result.current.stop("send"));
    unmount();
@@ -286,21 +547,45 @@ index 8c459800d..051a027ff 100644
      }),
    );
  
+@@ -414,8 +510,11 @@ it("surfaces a failed asynchronous transcript submission after unmount", async (
+     finishSubmission?.();
+   });
+   expect(appToast.error).toHaveBeenCalledWith(
+-    "Voice input failed",
+-    expect.objectContaining({ description: "Submission failed" }),
++    "Текст не вставился",
++    expect.objectContaining({
++      description:
++        "Submission failed. Текст пока только на экране — не закрывайте bb, нажмите «Вставить текст».",
++    }),
+   );
+ });
+ 
 diff --git a/apps/app/src/hooks/useVoiceInput.ts b/apps/app/src/hooks/useVoiceInput.ts
-index 740b1934a..a8239eca1 100644
+index 740b1934a..c111f8a1c 100644
 --- a/apps/app/src/hooks/useVoiceInput.ts
 +++ b/apps/app/src/hooks/useVoiceInput.ts
-@@ -4,7 +4,9 @@ import { useMicrophoneSignal } from "./useMicrophoneSignal";
+@@ -4,16 +4,27 @@ import { useMicrophoneSignal } from "./useMicrophoneSignal";
  import { useAudioInputDevices } from "./useAudioInputDevices";
  import { appToast } from "@/components/ui/app-toast";
  import { saveFile } from "@/lib/save-file";
 +import { HttpError } from "@/lib/api";
  import {
++  isLiveVoiceEnabled,
++  reportVoiceTiming,
++  startLiveTranscription,
++  type LiveTranscription,
++} from "@/lib/voice-live";
++import {
 +  beginVoiceDraft,
    deleteVoiceRecording,
    deleteVoiceRecordingsForKey,
    failVoiceRecording,
-@@ -14,6 +16,7 @@ import {
++  recordVoiceTranscript,
+   saveVoiceRecording,
++  withVoiceRecordingLock,
+   startVoiceRecordingRetry,
+   finishVoiceRecordingRetry,
    useFailedVoiceRecordings,
    type FailedVoiceRecording,
    type VoiceDelivery,
@@ -308,7 +593,7 @@ index 740b1934a..a8239eca1 100644
    type VoiceRecording,
  } from "@/lib/voice-recording-store";
  import {
-@@ -51,10 +54,123 @@ interface UseVoiceInputOptions {
+@@ -51,10 +62,127 @@ interface UseVoiceInputOptions {
  type TranscriptionResult =
    | { kind: "transcript"; text: string }
    | { kind: "cancelled" }
@@ -323,6 +608,10 @@ index 740b1934a..a8239eca1 100644
 +const TRANSCRIPTION_TIMEOUT_PER_MB_MS = 20_000;
 +const TRANSCRIPTION_MAX_TIMEOUT_MS = 20 * 60_000;
 +const OFFLINE_WAIT_MAX_MS = 60_000;
++const LIVE_FINISH_TIMEOUT_MS = 2_500;
++const RECORDER_BITS_PER_SECOND = 32_000;
++const DRAFT_SAVE_FAILED_MESSAGE =
++  "Не получается сохранить запись на телефоне — не закрывайте bb до конца записи";
 +const CANCELLED_TRANSCRIPTION_MESSAGE =
 +  "Расшифровка остановлена — запись сохранена";
 +const NON_RETRYABLE_STATUSES = new Set([400, 401, 403, 404, 413, 422, 501]);
@@ -433,11 +722,15 @@ index 740b1934a..a8239eca1 100644
  let nextEphemeralRecordingKey = 0;
  
  const HTML_DOCUMENT_PATTERN = /<!doctype html|<html[\s>]/i;
-@@ -156,6 +272,11 @@ export function useVoiceInput(options: UseVoiceInputOptions) {
+@@ -156,6 +284,15 @@ export function useVoiceInput(options: UseVoiceInputOptions) {
    const mediaRecorderRef = useRef<MediaRecorder | null>(null);
    const streamRef = useRef<MediaStream | null>(null);
    const chunksRef = useRef<Blob[]>([]);
 +  const draftRef = useRef<VoiceDraftHandle | null>(null);
++  const liveRef = useRef<LiveTranscription | null>(null);
++  const liveInFlightRef = useRef<LiveTranscription | null>(null);
++  const stopRequestedAtRef = useRef<number | null>(null);
++  const [liveText, setLiveText] = useState("");
 +  const pendingDraftChunksRef = useRef<Blob[]>([]);
 +  const draftFlushTimerRef = useRef<ReturnType<typeof setInterval> | null>(
 +    null,
@@ -445,7 +738,7 @@ index 740b1934a..a8239eca1 100644
    const startedAtMsRef = useRef<number | null>(null);
    const promptContextRef = useRef<string | undefined>(undefined);
    const shouldTranscribeRef = useRef(true);
-@@ -216,7 +337,7 @@ export function useVoiceInput(options: UseVoiceInputOptions) {
+@@ -216,7 +353,7 @@ export function useVoiceInput(options: UseVoiceInputOptions) {
  
    const showError = useCallback((message: string) => {
      setState("error");
@@ -454,7 +747,7 @@ index 740b1934a..a8239eca1 100644
    }, []);
  
    const stopMediaStream = useCallback(() => {
-@@ -230,6 +351,45 @@ export function useVoiceInput(options: UseVoiceInputOptions) {
+@@ -230,6 +367,45 @@ export function useVoiceInput(options: UseVoiceInputOptions) {
      setStream(null);
    }, []);
  
@@ -500,15 +793,19 @@ index 740b1934a..a8239eca1 100644
    const switchMicrophone = useCallback(
      async (deviceId: string | null) => {
        const recordingStream = recordingStreamRef.current;
-@@ -382,6 +542,7 @@ export function useVoiceInput(options: UseVoiceInputOptions) {
+@@ -382,6 +558,11 @@ export function useVoiceInput(options: UseVoiceInputOptions) {
        }
        const acceptedRecordingPending = acceptedRecordingPendingRef.current;
        mediaRecorderRef.current = null;
-+      if (!acceptedRecordingPending) closeDraft("discard");
++      if (!acceptedRecordingPending) {
++        closeDraft("discard");
++        liveRef.current?.abort();
++        liveRef.current = null;
++      }
        if (!acceptedRecordingPending) {
          chunksRef.current = [];
          startedAtMsRef.current = null;
-@@ -390,7 +551,7 @@ export function useVoiceInput(options: UseVoiceInputOptions) {
+@@ -390,7 +571,7 @@ export function useVoiceInput(options: UseVoiceInputOptions) {
        releaseRecordingWakeLock();
        if (!acceptedRecordingPending) stopMediaStream();
      };
@@ -517,23 +814,28 @@ index 740b1934a..a8239eca1 100644
  
    useEffect(() => {
      mountedRef.current = true;
-@@ -419,11 +580,11 @@ export function useVoiceInput(options: UseVoiceInputOptions) {
+@@ -419,16 +600,14 @@ export function useVoiceInput(options: UseVoiceInputOptions) {
        beforeDelivery: (() => Promise<void> | undefined) | undefined,
      ): Promise<TranscriptionResult> => {
        try {
 -        const transcript = await options.onTranscribe({
 -          file: recording.file,
 -          promptContext: recording.promptContext,
-+        const transcript = await transcribeWithRetry(
-+          options.onTranscribe,
-+          recording,
-           signal,
+-          signal,
 -        });
-+        );
++        const transcript =
++          recording.transcript ??
++          (await transcribeWithRetry(options.onTranscribe, recording, signal));
          const text = normalizeTranscript(transcript);
          if (!signal.aborted && text.length === 0) {
            throw new Error("Voice transcription returned an empty result.");
-@@ -436,7 +597,11 @@ export function useVoiceInput(options: UseVoiceInputOptions) {
+         }
+-        await beforeDelivery?.();
++        void beforeDelivery?.();
+         return signal.aborted
+           ? { kind: "cancelled" }
+           : { kind: "transcript", text };
+@@ -436,7 +615,11 @@ export function useVoiceInput(options: UseVoiceInputOptions) {
          return signal.aborted ||
            (error instanceof DOMException && error.name === "AbortError")
            ? { kind: "cancelled" }
@@ -546,7 +848,7 @@ index 740b1934a..a8239eca1 100644
        }
      },
      [options],
-@@ -446,28 +611,34 @@ export function useVoiceInput(options: UseVoiceInputOptions) {
+@@ -446,33 +629,48 @@ export function useVoiceInput(options: UseVoiceInputOptions) {
      async (
        recording: VoiceRecording,
        result: TranscriptionResult,
@@ -581,22 +883,121 @@ index 740b1934a..a8239eca1 100644
          return;
        }
 -      void deleteVoiceRecording(recording.id);
-+      await deleteVoiceRecording(recording.id);
++      const textSaved = await recordVoiceTranscript(
++        recording.id,
++        result.text,
++      );
        try {
          await options.onTranscript(result.text, recording.delivery);
++        await deleteVoiceRecording(recording.id);
        } catch (error) {
-@@ -493,7 +664,7 @@ export function useVoiceInput(options: UseVoiceInputOptions) {
+-        appToast.error("Voice input failed", {
+-          description: resolveRecordingErrorMessage(error),
++        autoRetriedRecordingIds.add(recording.id);
++        noAutoRetryRecordingIds.add(recording.id);
++        failVoiceRecording(recording.id, "Текст готов — нажмите «Вставить»");
++        appToast.error("Текст не вставился", {
++          description: textSaved
++            ? `${resolveRecordingErrorMessage(error)}. Текст сохранён — его можно вставить.`
++            : `${resolveRecordingErrorMessage(error)}. Текст пока только на экране — не закрывайте bb, нажмите «Вставить текст».`,
+         });
+       }
+     },
+@@ -480,21 +678,63 @@ export function useVoiceInput(options: UseVoiceInputOptions) {
+   );
+ 
+   const transcribeRecording = useCallback(
+-    async (recording: VoiceRecording) => {
++    async (
++      recording: VoiceRecording,
++      live: LiveTranscription | null,
++      timing: { stopAt: number; audioMs: number },
++    ) => {
+       setState("transcribing");
+       setDelivery(recording.delivery);
+       const abortController = new AbortController();
+       transcriptionAbortRef.current = abortController;
+-      const result = await runTranscription(
++      let path = "batch";
++      let model = "";
++      let liveFailure = live ? "" : "off";
++      let result: TranscriptionResult | null = null;
++      if (live) {
++        liveInFlightRef.current = live;
++        const liveResult = await live.finish(LIVE_FINISH_TIMEOUT_MS);
++        liveInFlightRef.current = null;
++        if (abortController.signal.aborted) {
++          result = { kind: "cancelled" };
++        } else if (liveResult.ok) {
++          const text = normalizeTranscript(liveResult.text);
++          if (text) {
++            path = "live";
++            model = liveResult.model;
++            void options.playCompletionTransition?.();
++            result = { kind: "transcript", text };
++          } else {
++            liveFailure = "empty";
++          }
++        } else {
++          liveFailure = liveResult.reason;
++        }
++      }
++      const textAt = () => Date.now() - timing.stopAt;
++      result ??= await runTranscription(
+         recording,
+         abortController.signal,
+         options.playCompletionTransition,
+       );
++      const stopToText = textAt();
        if (transcriptionAbortRef.current === abortController) {
          transcriptionAbortRef.current = null;
        }
 -      await settleTranscription(recording, result, "discard");
++      setLiveText("");
 +      await settleTranscription(recording, result, "save");
        setState("idle");
++      reportVoiceTiming({
++        path,
++        model,
++        outcome: result.kind,
++        delivery: recording.delivery,
++        bytes: recording.file.size,
++        audioMs: timing.audioMs,
++        stopToText,
++        stopToDone: Date.now() - timing.stopAt,
++        liveFailure,
++      });
      },
      [options, runTranscription, settleTranscription],
-@@ -558,6 +729,18 @@ export function useVoiceInput(options: UseVoiceInputOptions) {
-         ? new MediaRecorder(recorderInput, { mimeType: preferredMimeType })
-         : new MediaRecorder(recorderInput);
+   );
+@@ -555,9 +795,42 @@ export function useVoiceInput(options: UseVoiceInputOptions) {
+       const recorderInput = recordingStream?.stream ?? stream;
+       const preferredMimeType = resolvePreferredAudioMimeType();
+       const recorder = preferredMimeType
+-        ? new MediaRecorder(recorderInput, { mimeType: preferredMimeType })
+-        : new MediaRecorder(recorderInput);
++        ? new MediaRecorder(recorderInput, {
++            mimeType: preferredMimeType,
++            audioBitsPerSecond: RECORDER_BITS_PER_SECOND,
++          })
++        : new MediaRecorder(recorderInput, {
++            audioBitsPerSecond: RECORDER_BITS_PER_SECOND,
++          });
++      liveRef.current?.abort();
++      liveRef.current = null;
++      setLiveText("");
++      if (recordingStream && isLiveVoiceEnabled()) {
++        const live = startLiveTranscription({
++          onText: (text) => {
++            if (mountedRef.current) setLiveText(text);
++          },
++        });
++        if (recordingStream.tapPcm((samples, rate) => live.push(samples, rate))) {
++          liveRef.current = live;
++        } else {
++          live.abort();
++        }
++      }
        mediaRecorderRef.current = recorder;
 +      closeDraft("discard");
 +      if (persistRecordings) {
@@ -604,6 +1005,7 @@ index 740b1934a..a8239eca1 100644
 +          key: recordingKey,
 +          mimeType: recorder.mimeType || preferredMimeType || "audio/webm",
 +          promptContext: promptContextRef.current,
++          onError: () => setCaptureError(DRAFT_SAVE_FAILED_MESSAGE),
 +        });
 +        draftFlushTimerRef.current = setInterval(
 +          flushDraft,
@@ -613,7 +1015,7 @@ index 740b1934a..a8239eca1 100644
  
        recorder.onstart = () => {
          setState("recording");
-@@ -566,6 +749,7 @@ export function useVoiceInput(options: UseVoiceInputOptions) {
+@@ -566,6 +839,7 @@ export function useVoiceInput(options: UseVoiceInputOptions) {
        recorder.ondataavailable = (event: BlobEvent) => {
          if (event.data.size > 0) {
            chunksRef.current.push(event.data);
@@ -621,38 +1023,59 @@ index 740b1934a..a8239eca1 100644
          }
        };
  
-@@ -579,6 +763,7 @@ export function useVoiceInput(options: UseVoiceInputOptions) {
+@@ -574,11 +848,16 @@ export function useVoiceInput(options: UseVoiceInputOptions) {
+       };
+ 
+       recorder.onstop = async () => {
++        const live = liveRef.current;
++        liveRef.current = null;
+         acceptedRecordingPendingRef.current = false;
+         releaseRecordingWakeLock();
          stopMediaStream();
  
          if (!shouldTranscribeRef.current) {
++          live?.abort();
++          setLiveText("");
 +          closeDraft("discard");
            shouldTranscribeRef.current = true;
            chunksRef.current = [];
            promptContextRef.current = undefined;
-@@ -591,6 +776,7 @@ export function useVoiceInput(options: UseVoiceInputOptions) {
+@@ -591,6 +870,9 @@ export function useVoiceInput(options: UseVoiceInputOptions) {
          const durationMs = Date.now() - startedAtMs;
  
          if (durationMs < MIN_RECORDING_DURATION_MS) {
++          live?.abort();
++          setLiveText("");
 +          closeDraft("discard");
            showError("Recording too short (minimum 1 second)");
            chunksRef.current = [];
            promptContextRef.current = undefined;
-@@ -600,6 +786,7 @@ export function useVoiceInput(options: UseVoiceInputOptions) {
+@@ -600,6 +882,9 @@ export function useVoiceInput(options: UseVoiceInputOptions) {
          const chunks = chunksRef.current;
          chunksRef.current = [];
          if (chunks.length === 0) {
++          live?.abort();
++          setLiveText("");
 +          closeDraft("discard");
            showError("No audio was captured");
            promptContextRef.current = undefined;
            return;
-@@ -619,13 +806,14 @@ export function useVoiceInput(options: UseVoiceInputOptions) {
+@@ -619,13 +904,21 @@ export function useVoiceInput(options: UseVoiceInputOptions) {
              promptContext,
              delivery: deliveryRef.current,
            },
 -          { persist: persistRecordings },
 +          { persist: persistRecordings, draftId: closeDraft("keep") },
++        );
++        const stopAt = stopRequestedAtRef.current ?? Date.now();
++        stopRequestedAtRef.current = null;
++        await withVoiceRecordingLock(recording.id, () =>
++          transcribeRecording(recording, live, {
++            stopAt,
++            audioMs: durationMs,
++          }),
          );
-         await transcribeRecording(recording);
+-        await transcribeRecording(recording);
        };
  
        recorder.start(CHUNK_TIMESLICE_MS);
@@ -661,7 +1084,7 @@ index 740b1934a..a8239eca1 100644
        stopMediaStream();
        mediaRecorderRef.current = null;
        chunksRef.current = [];
-@@ -645,6 +833,8 @@ export function useVoiceInput(options: UseVoiceInputOptions) {
+@@ -645,6 +938,8 @@ export function useVoiceInput(options: UseVoiceInputOptions) {
        startingRef.current = false;
      }
    }, [
@@ -670,10 +1093,43 @@ index 740b1934a..a8239eca1 100644
      isSupported,
      options,
      unsupportedReason,
-@@ -696,6 +886,27 @@ export function useVoiceInput(options: UseVoiceInputOptions) {
+@@ -671,6 +966,7 @@ export function useVoiceInput(options: UseVoiceInputOptions) {
+         return;
+       }
+       deliveryRef.current = nextDelivery;
++      stopRequestedAtRef.current = Date.now();
+       setDelivery(nextDelivery);
+       shouldTranscribeRef.current = true;
+       acceptedRecordingPendingRef.current = true;
+@@ -684,11 +980,11 @@ export function useVoiceInput(options: UseVoiceInputOptions) {
+     [showError, state],
+   );
+ 
+-  const retry = useCallback(
+-    (recording: FailedVoiceRecording) => {
++  const retryAsync = useCallback(
++    (recording: FailedVoiceRecording): Promise<void> => {
+       const signal = startVoiceRecordingRetry(recording.id);
+-      if (!signal) return;
+-      void runTranscription(recording, signal, undefined).then((result) => {
++      if (!signal) return Promise.resolve();
++      return runTranscription(recording, signal, undefined).then((result) => {
+         if (!finishVoiceRecordingRetry(recording.id, signal)) return;
+         return settleTranscription(recording, result, "keep");
+       });
+@@ -696,6 +992,39 @@ export function useVoiceInput(options: UseVoiceInputOptions) {
      [runTranscription, settleTranscription],
    );
  
++  const retry = useCallback(
++    (recording: FailedVoiceRecording) => {
++      void retryAsync(
++        recording.transcript ? { ...recording, delivery: "insert" } : recording,
++      );
++    },
++    [retryAsync],
++  );
++
 +  useEffect(() => {
 +    const autoRetry = (force: boolean) => {
 +      for (const recording of failedRecordings) {
@@ -685,7 +1141,10 @@ index 740b1934a..a8239eca1 100644
 +        }
 +        if (!force && autoRetriedRecordingIds.has(recording.id)) continue;
 +        autoRetriedRecordingIds.add(recording.id);
-+        retry({ ...recording, delivery: "insert" });
++        if (recording.transcript) continue;
++        void withVoiceRecordingLock(recording.id, () =>
++          retryAsync({ ...recording, delivery: "insert" }),
++        );
 +      }
 +    };
 +    autoRetry(false);
@@ -693,11 +1152,544 @@ index 740b1934a..a8239eca1 100644
 +    const onOnline = () => autoRetry(true);
 +    window.addEventListener("online", onOnline);
 +    return () => window.removeEventListener("online", onOnline);
-+  }, [failedRecordings, retry]);
++  }, [failedRecordings, retryAsync]);
 +
    const discard = useCallback((recording: FailedVoiceRecording) => {
      void deleteVoiceRecording(recording.id);
    }, []);
+@@ -705,6 +1034,7 @@ export function useVoiceInput(options: UseVoiceInputOptions) {
+   }, []);
+ 
+   const cancel = useCallback(() => {
++    if (state === "transcribing") liveInFlightRef.current?.abort();
+     if (state === "recording") {
+       const recorder = mediaRecorderRef.current;
+       if (recorder && recorder.state === "recording") {
+@@ -750,6 +1080,7 @@ export function useVoiceInput(options: UseVoiceInputOptions) {
+     isProcessing: state === "transcribing",
+     isListening: state === "recording" || state === "transcribing",
+     delivery,
++    liveText,
+     failedRecordings,
+     start,
+     stop,
+diff --git a/apps/app/src/lib/microphone-recording-stream.ts b/apps/app/src/lib/microphone-recording-stream.ts
+index dea69c624..337e247dd 100644
+--- a/apps/app/src/lib/microphone-recording-stream.ts
++++ b/apps/app/src/lib/microphone-recording-stream.ts
+@@ -2,18 +2,51 @@ export function createMicrophoneRecordingStream(input: MediaStream) {
+   const context = new AudioContext();
+   try {
+     const destination = context.createMediaStreamDestination();
++    try {
++      destination.channelCount = 1;
++      destination.channelCountMode = "explicit";
++    } catch {
++      destination.channelCount = destination.channelCount;
++    }
+     let source = context.createMediaStreamSource(input);
+     source.connect(destination);
++    let tap: ScriptProcessorNode | null = null;
++    let tapSink: GainNode | null = null;
+     return {
+       stream: destination.stream,
+       resume: () => context.resume(),
++      tapPcm(onSamples: (samples: Float32Array, sampleRate: number) => void) {
++        if (tap || typeof context.createScriptProcessor !== "function") {
++          return false;
++        }
++        tap = context.createScriptProcessor(4096, 1, 1);
++        tapSink = context.createGain();
++        tapSink.gain.value = 0;
++        tap.onaudioprocess = (event) => {
++          onSamples(
++            new Float32Array(event.inputBuffer.getChannelData(0)),
++            context.sampleRate,
++          );
++        };
++        source.connect(tap);
++        tap.connect(tapSink);
++        tapSink.connect(context.destination);
++        return true;
++      },
+       replace(next: MediaStream) {
+         const nextSource = context.createMediaStreamSource(next);
+         nextSource.connect(destination);
++        if (tap) nextSource.connect(tap);
+         source.disconnect();
+         source = nextSource;
+       },
+       close() {
++        if (tap) {
++          tap.onaudioprocess = null;
++          tap.disconnect();
++          tapSink?.disconnect();
++          tap = null;
++        }
+         source.disconnect();
+         destination.stream.getTracks().forEach((track) => track.stop());
+         void context.close().catch(() => {});
+diff --git a/apps/app/src/lib/voice-live.test.ts b/apps/app/src/lib/voice-live.test.ts
+new file mode 100644
+index 000000000..b66e6c3da
+--- /dev/null
++++ b/apps/app/src/lib/voice-live.test.ts
+@@ -0,0 +1,111 @@
++// @vitest-environment jsdom
++
++import { afterEach, beforeEach, expect, it, vi } from "vitest";
++import { startLiveTranscription } from "./voice-live";
++
++class FakeSocket {
++  static OPEN = 1;
++  static last: FakeSocket | undefined;
++  readyState = 0;
++  sent: { commit: boolean; audio: string }[] = [];
++  onmessage: ((event: { data: string }) => void) | null = null;
++  onerror: (() => void) | null = null;
++  onclose: ((event: { code: number }) => void) | null = null;
++  constructor(public url: string) {
++    FakeSocket.last = this;
++    queueMicrotask(() => {
++      this.readyState = 1;
++      this.emit({ message_type: "session_started" });
++    });
++  }
++  send(data: string) {
++    const parsed = JSON.parse(data) as { commit: boolean; audio_base_64: string };
++    this.sent.push({ commit: parsed.commit, audio: parsed.audio_base_64 });
++  }
++  close() {
++    this.readyState = 3;
++  }
++  emit(message: Record<string, unknown>) {
++    this.onmessage?.({ data: JSON.stringify(message) });
++  }
++  commits() {
++    return this.sent.filter((entry) => entry.commit).length;
++  }
++}
++
++beforeEach(() => {
++  FakeSocket.last = undefined;
++  vi.stubGlobal("WebSocket", FakeSocket);
++  vi.stubGlobal(
++    "fetch",
++    vi.fn(async () =>
++      new Response(
++        JSON.stringify({ ok: true, token: "t", models: ["m1"], language: "ru" }),
++      ),
++    ),
++  );
++});
++
++afterEach(() => {
++  vi.unstubAllGlobals();
++  vi.useRealTimers();
++});
++
++async function connected() {
++  const texts: string[] = [];
++  const live = startLiveTranscription({ onText: (text) => texts.push(text) });
++  await vi.waitFor(() => expect(FakeSocket.last?.readyState).toBe(1));
++  await new Promise((resolve) => setTimeout(resolve, 0));
++  return { live, texts, socket: FakeSocket.last! };
++}
++
++const speech = () => new Float32Array(4800).fill(0.3);
++const silence = () => new Float32Array(4800);
++
++it("waits for the answer to its own final commit, not an earlier one", async () => {
++  const { live, socket } = await connected();
++  for (let index = 0; index < 110; index += 1) live.push(speech(), 48_000);
++  for (let index = 0; index < 10; index += 1) live.push(silence(), 48_000);
++  expect(socket.commits()).toBe(1);
++  live.push(speech(), 48_000);
++  const result = live.finish(2_000);
++  expect(socket.commits()).toBe(2);
++  socket.emit({ message_type: "committed_transcript", text: "Первая фраза." });
++  let settled = false;
++  void result.then(() => (settled = true));
++  await new Promise((resolve) => setTimeout(resolve, 10));
++  expect(settled).toBe(false);
++  socket.emit({ message_type: "committed_transcript", text: "Последние слова." });
++  await expect(result).resolves.toEqual({
++    ok: true,
++    text: "Первая фраза. Последние слова.",
++    model: "m1",
++  });
++});
++
++it("treats a dropped connection during stop as a failure, even with partial text", async () => {
++  const { live, socket } = await connected();
++  live.push(speech(), 48_000);
++  socket.emit({ message_type: "partial_transcript", text: "почти всё" });
++  const result = live.finish(2_000);
++  socket.onclose?.({ code: 1006 });
++  await expect(result).resolves.toEqual({ ok: false, reason: "closed 1006" });
++});
++
++it("falls back when the final answer does not arrive in time", async () => {
++  const { live, socket } = await connected();
++  live.push(speech(), 48_000);
++  socket.emit({ message_type: "committed_transcript", text: "Не последняя" });
++  const result = await live.finish(30);
++  expect(result).toEqual({ ok: false, reason: "final not confirmed" });
++});
++
++it("buffers audio until the session opens and still confirms the final text", async () => {
++  const live = startLiveTranscription({ onText: () => {} });
++  live.push(speech(), 48_000);
++  const result = live.finish(2_000);
++  await vi.waitFor(() => expect(FakeSocket.last?.commits()).toBe(1));
++  expect(FakeSocket.last!.sent[0]?.audio.length).toBeGreaterThan(0);
++  FakeSocket.last!.emit({ message_type: "committed_transcript", text: "Коротко" });
++  await expect(result).resolves.toMatchObject({ ok: true, text: "Коротко" });
++});
+diff --git a/apps/app/src/lib/voice-live.ts b/apps/app/src/lib/voice-live.ts
+new file mode 100644
+index 000000000..cd93c6418
+--- /dev/null
++++ b/apps/app/src/lib/voice-live.ts
+@@ -0,0 +1,338 @@
++import { appSurfaceRequestInit } from "@/lib/app-surface";
++
++const LIVE_PLUGIN_ID = "voice-fast";
++const LIVE_TOKEN_PATH = `/api/v1/plugins/${LIVE_PLUGIN_ID}/http/live-token`;
++const LIVE_TIMING_PATH = `/api/v1/plugins/${LIVE_PLUGIN_ID}/http/timing`;
++const LIVE_SOCKET_URL = "wss://api.elevenlabs.io/v1/speech-to-text/realtime";
++const LIVE_SAMPLE_RATE = 16_000;
++const LIVE_SEND_SAMPLES = 1_600;
++const LIVE_MAX_BUFFERED_SAMPLES = LIVE_SAMPLE_RATE * 30;
++const LIVE_DISABLED_STORAGE_KEY = "bb-voice-live-disabled";
++const LIVE_PAUSE_COMMIT_SILENCE_SAMPLES = Math.round(LIVE_SAMPLE_RATE * 0.7);
++const LIVE_PAUSE_COMMIT_MIN_SAMPLES = LIVE_SAMPLE_RATE * 10;
++const LIVE_SILENCE_RMS = 0.012;
++
++export interface LiveTranscription {
++  push(samples: Float32Array, sampleRate: number): void;
++  finish(timeoutMs: number): Promise<LiveResult>;
++  abort(): void;
++}
++
++export type LiveResult =
++  | { ok: true; text: string; model: string }
++  | { ok: false; reason: string };
++
++interface TokenResponse {
++  ok: boolean;
++  token?: string;
++  models?: string[];
++  language?: string;
++}
++
++export function isLiveVoiceEnabled(): boolean {
++  if (typeof window === "undefined" || typeof WebSocket === "undefined") {
++    return false;
++  }
++  try {
++    return window.localStorage.getItem(LIVE_DISABLED_STORAGE_KEY) !== "1";
++  } catch {
++    return true;
++  }
++}
++
++export function reportVoiceTiming(
++  timing: Record<string, string | number | boolean>,
++): void {
++  if (typeof fetch === "undefined") return;
++  void fetch(
++    LIVE_TIMING_PATH,
++    appSurfaceRequestInit({
++      method: "POST",
++      headers: { "content-type": "application/json" },
++      body: JSON.stringify(timing),
++      keepalive: true,
++    }),
++  ).catch(() => {});
++}
++
++function downsample(input: Float32Array, inputRate: number): Int16Array {
++  const ratio = inputRate / LIVE_SAMPLE_RATE;
++  const length = Math.floor(input.length / ratio);
++  const output = new Int16Array(length);
++  for (let index = 0; index < length; index += 1) {
++    const start = Math.floor(index * ratio);
++    const end = Math.min(input.length, Math.floor((index + 1) * ratio));
++    let sum = 0;
++    for (let cursor = start; cursor < end; cursor += 1) sum += input[cursor]!;
++    const value = end > start ? sum / (end - start) : 0;
++    const clamped = Math.max(-1, Math.min(1, value));
++    output[index] = clamped < 0 ? clamped * 0x8000 : clamped * 0x7fff;
++  }
++  return output;
++}
++
++function toBase64(samples: Int16Array): string {
++  const bytes = new Uint8Array(
++    samples.buffer,
++    samples.byteOffset,
++    samples.byteLength,
++  );
++  let binary = "";
++  for (let index = 0; index < bytes.length; index += 0x8000) {
++    binary += String.fromCharCode(...bytes.subarray(index, index + 0x8000));
++  }
++  return btoa(binary);
++}
++
++async function fetchToken(signal: AbortSignal): Promise<TokenResponse> {
++  const response = await fetch(
++    LIVE_TOKEN_PATH,
++    appSurfaceRequestInit({
++      method: "POST",
++      headers: { "content-type": "application/json" },
++      body: "{}",
++      signal,
++    }),
++  );
++  if (!response.ok) throw new Error(`token HTTP ${response.status}`);
++  const body = (await response.json()) as TokenResponse;
++  if (!body.ok || typeof body.token !== "string") throw new Error("no token");
++  return body;
++}
++
++export function startLiveTranscription(options: {
++  onText: (text: string) => void;
++}): LiveTranscription {
++  const controller = new AbortController();
++  let socket = null as WebSocket | null;
++  let model = "";
++  let pending: Int16Array[] = [];
++  let pendingSamples = 0;
++  let outbox: Int16Array[] = [];
++  let outboxSamples = 0;
++  let committed = "";
++  let commitsSent = 0;
++  let commitsReceived = 0;
++  let silentSamples = 0;
++  let samplesSinceCommit = 0;
++  let partial = "";
++  let failure: string | null = null;
++  let finishing = false;
++  let settleFinish: (() => void) | null = null;
++
++  const fail = (reason: string) => {
++    if (failure) return;
++    failure = reason;
++    settleFinish?.();
++  };
++
++  const currentText = () =>
++    [committed, partial].filter((part) => part.trim().length > 0).join(" ");
++
++  const sendSamples = (samples: Int16Array, commit: boolean): boolean => {
++    if (!socket || socket.readyState !== WebSocket.OPEN) return false;
++    if (commit) {
++      commitsSent += 1;
++      samplesSinceCommit = 0;
++    }
++    socket.send(
++      JSON.stringify({
++        message_type: "input_audio_chunk",
++        audio_base_64: samples.length > 0 ? toBase64(samples) : "",
++        commit,
++        sample_rate: LIVE_SAMPLE_RATE,
++      }),
++    );
++    return true;
++  };
++
++  const flushOutbox = (commit: boolean) => {
++    if (outboxSamples === 0 && !commit) return;
++    const merged = new Int16Array(outboxSamples);
++    let offset = 0;
++    for (const part of outbox) {
++      merged.set(part, offset);
++      offset += part.length;
++    }
++    outbox = [];
++    outboxSamples = 0;
++    sendSamples(merged, commit);
++  };
++
++  const enqueue = (samples: Int16Array, rms: number) => {
++    if (socket && socket.readyState === WebSocket.OPEN) {
++      outbox.push(samples);
++      outboxSamples += samples.length;
++      samplesSinceCommit += samples.length;
++      silentSamples =
++        rms < LIVE_SILENCE_RMS ? silentSamples + samples.length : 0;
++      const pause =
++        silentSamples >= LIVE_PAUSE_COMMIT_SILENCE_SAMPLES &&
++        samplesSinceCommit >= LIVE_PAUSE_COMMIT_MIN_SAMPLES;
++      if (pause) {
++        silentSamples = 0;
++        flushOutbox(true);
++      } else if (outboxSamples >= LIVE_SEND_SAMPLES) {
++        flushOutbox(false);
++      }
++      return;
++    }
++    pending.push(samples);
++    pendingSamples += samples.length;
++    if (pendingSamples > LIVE_MAX_BUFFERED_SAMPLES) fail("buffer overflow");
++  };
++
++  const connect = (token: string, modelId: string, language: string) =>
++    new Promise<void>((resolve, reject) => {
++      const params = new URLSearchParams({
++        model_id: modelId,
++        token,
++        audio_format: "pcm_16000",
++        commit_strategy: "manual",
++        language_code: language,
++      });
++      const next = new WebSocket(`${LIVE_SOCKET_URL}?${params.toString()}`);
++      let started = false;
++      next.onmessage = (event) => {
++        let message: { message_type?: string; text?: string; error?: string };
++        try {
++          message = JSON.parse(String(event.data)) as typeof message;
++        } catch {
++          return;
++        }
++        const type = message.message_type ?? "";
++        if (type === "session_started") {
++          started = true;
++          resolve();
++          return;
++        }
++        if (type === "partial_transcript") {
++          partial = message.text ?? "";
++          options.onText(currentText());
++          return;
++        }
++        if (type.startsWith("committed_transcript")) {
++          const text = (message.text ?? "").trim();
++          if (text) committed = committed ? `${committed} ${text}` : text;
++          partial = "";
++          commitsReceived += 1;
++          options.onText(currentText());
++          if (finishing && commitsReceived >= commitsSent) settleFinish?.();
++          return;
++        }
++        if (type.includes("error") || message.error) {
++          const reason = `${type || "error"}: ${message.error ?? ""}`.slice(
++            0,
++            120,
++          );
++          if (!started) reject(new Error(reason));
++          else fail(reason);
++        }
++      };
++      next.onerror = () => {
++        if (!started) reject(new Error("socket error"));
++        else fail("socket error");
++      };
++      next.onclose = (event) => {
++        if (!started) reject(new Error(`closed ${event.code}`));
++        else if (
++          !finishing ||
++          commitsSent === 0 ||
++          commitsReceived < commitsSent
++        ) {
++          fail(`closed ${event.code}`);
++        }
++      };
++      socket = next;
++    });
++
++  void (async () => {
++    try {
++      const token = await fetchToken(controller.signal);
++      const models = token.models?.length ? token.models : ["scribe_v2_realtime"];
++      let lastError: unknown = null;
++      for (const [index, modelId] of models.entries()) {
++        if (controller.signal.aborted) return;
++        try {
++          const fresh =
++            index === 0 ? token : await fetchToken(controller.signal);
++          await connect(fresh.token!, modelId, token.language ?? "ru");
++          model = modelId;
++          lastError = null;
++          break;
++        } catch (error) {
++          lastError = error;
++          socket?.close();
++          socket = null;
++        }
++      }
++      if (lastError) throw lastError;
++      if (controller.signal.aborted) {
++        socket?.close();
++        return;
++      }
++      const buffered = pending;
++      pending = [];
++      pendingSamples = 0;
++      for (const part of buffered) enqueue(part, 1);
++      if (finishing) {
++        flushOutbox(true);
++      }
++    } catch (error) {
++      fail(error instanceof Error ? error.message : String(error));
++    }
++  })();
++
++  return {
++    push(samples, sampleRate) {
++      if (failure || finishing || controller.signal.aborted) return;
++      let energy = 0;
++      for (let index = 0; index < samples.length; index += 1) {
++        energy += samples[index]! * samples[index]!;
++      }
++      const rms = samples.length > 0 ? Math.sqrt(energy / samples.length) : 0;
++      enqueue(downsample(samples, sampleRate), rms);
++    },
++    finish(timeoutMs) {
++      finishing = true;
++      return new Promise<LiveResult>((resolve) => {
++        let done = false;
++        let confirmed = false;
++        const timer = setTimeout(complete, timeoutMs);
++        function complete() {
++          if (done) return;
++          done = true;
++          clearTimeout(timer);
++          settleFinish = null;
++          const text = committed.trim();
++          socket?.close();
++          controller.abort();
++          if (failure) resolve({ ok: false, reason: failure });
++          else if (!model) resolve({ ok: false, reason: "not connected" });
++          else if (!confirmed) {
++            resolve({ ok: false, reason: "final not confirmed" });
++          } else if (!text) resolve({ ok: false, reason: "empty" });
++          else resolve({ ok: true, text, model });
++        }
++        settleFinish = () => {
++          confirmed =
++            !failure && commitsSent > 0 && commitsReceived >= commitsSent;
++          complete();
++        };
++        if (failure) {
++          complete();
++          return;
++        }
++        if (socket && socket.readyState === WebSocket.OPEN && model) {
++          flushOutbox(true);
++        }
++      });
++    },
++    abort() {
++      finishing = true;
++      fail("aborted");
++      controller.abort();
++      socket?.close();
++    },
++  };
++}
 diff --git a/apps/app/src/lib/voice-recording-store.test.tsx b/apps/app/src/lib/voice-recording-store.test.tsx
 index 794840ad1..06adbccf8 100644
 --- a/apps/app/src/lib/voice-recording-store.test.tsx
@@ -835,7 +1827,7 @@ index 794840ad1..06adbccf8 100644
 +  expect(await result.current[0]?.file.text()).toBe("full audio");
 +});
 diff --git a/apps/app/src/lib/voice-recording-store.ts b/apps/app/src/lib/voice-recording-store.ts
-index 732aa9ff1..67572ec17 100644
+index 732aa9ff1..1c40a9b8d 100644
 --- a/apps/app/src/lib/voice-recording-store.ts
 +++ b/apps/app/src/lib/voice-recording-store.ts
 @@ -2,6 +2,7 @@ import { useSyncExternalStore } from "react";
@@ -846,11 +1838,72 @@ index 732aa9ff1..67572ec17 100644
    getMany,
    keys,
    set,
-@@ -71,6 +72,194 @@ function enqueueDatabaseTask(
+@@ -18,6 +19,7 @@ export interface VoiceRecording {
+   promptContext: string | undefined;
+   delivery: VoiceDelivery;
+   createdAt: number;
++  transcript?: string;
+ }
+ 
+ export interface FailedVoiceRecording extends VoiceRecording {
+@@ -44,6 +46,7 @@ const storedRecordingSchema = z.object({
+   promptContext: z.string().nullable(),
+   delivery: z.enum(["insert", "send"]),
+   createdAt: z.number(),
++  transcript: z.string().nullable().optional(),
+ });
+ 
+ type StoredRecording = z.infer<typeof storedRecordingSchema>;
+@@ -71,6 +74,270 @@ function enqueueDatabaseTask(
    return databaseQueue;
  }
  
 +const DRAFT_RECOVERY_MIN_AGE_MS = 20_000;
++const TRANSCRIPT_READY_MESSAGE = "Текст готов — нажмите «Вставить»";
++
++function draftLockName(draftId: string): string {
++  return `bb-voice-draft:${draftId}`;
++}
++
++function locksApi(): LockManager | null {
++  return typeof navigator !== "undefined" && navigator.locks
++    ? navigator.locks
++    : null;
++}
++
++async function isDraftLockFree(draftId: string): Promise<boolean | null> {
++  const locks = locksApi();
++  if (!locks) return null;
++  try {
++    return await locks.request(
++      draftLockName(draftId),
++      { ifAvailable: true },
++      async (lock) => lock !== null,
++    );
++  } catch {
++    return null;
++  }
++}
++
++export async function withVoiceRecordingLock(
++  id: string,
++  task: () => Promise<void>,
++): Promise<boolean> {
++  const locks = locksApi();
++  if (!locks) {
++    await task();
++    return true;
++  }
++  return locks.request(
++    `bb-voice-recording:${id}`,
++    { ifAvailable: true },
++    async (lock) => {
++      if (!lock) return false;
++      await task();
++      return true;
++    },
++  );
++}
 +const RECOVERED_DRAFT_MESSAGE =
 +  "Запись прервалась — сохранена, расшифровываю заново";
 +const draftStoredChunkSchema = z.object({
@@ -899,10 +1952,17 @@ index 732aa9ff1..67572ec17 100644
 +  key: string;
 +  mimeType: string;
 +  promptContext: string | undefined;
++  onError?: () => void;
 +}): VoiceDraftHandle {
 +  const createdAt = Date.now();
 +  const id = `draft-${createdAt.toString(36)}-${Math.random().toString(36).slice(2)}`;
 +  activeDraftIds.add(id);
++  const locks = locksApi();
++  if (locks) {
++    void locks
++      .request(draftLockName(id), () => draftLockReleased(id))
++      .catch(() => {});
++  }
 +  let seq = 0;
 +  let closed = false;
 +  return {
@@ -913,33 +1973,55 @@ index 732aa9ff1..67572ec17 100644
 +      const index = seq++;
 +      return enqueueDraftTask(async (store) => {
 +        if (closed) return;
-+        await set(
-+          [args.key, id, index],
-+          {
-+            key: args.key,
-+            draftId: id,
-+            seq: index,
-+            audio: await blob.arrayBuffer(),
-+            mimeType: args.mimeType,
-+            promptContext: args.promptContext ?? null,
-+            createdAt,
-+            updatedAt: Date.now(),
-+          },
-+          store,
-+        );
++        const row = {
++          key: args.key,
++          draftId: id,
++          seq: index,
++          audio: await blob.arrayBuffer(),
++          mimeType: args.mimeType,
++          promptContext: args.promptContext ?? null,
++          createdAt,
++          updatedAt: Date.now(),
++        };
++        try {
++          await set([args.key, id, index], row, store);
++        } catch {
++          try {
++            await set([args.key, id, index], row, store);
++          } catch {
++            args.onError?.();
++          }
++        }
 +      });
 +    },
 +    discard() {
 +      closed = true;
 +      activeDraftIds.delete(id);
++      releaseDraftLock(id);
 +      return enqueueDraftTask((store) => deleteDraftRows(store, id));
 +    },
 +  };
 +}
 +
++const draftLockReleasers = new Map<string, () => void>();
++
++function draftLockReleased(draftId: string): Promise<void> {
++  return new Promise((resolve) => {
++    if (!activeDraftIds.has(draftId)) return resolve();
++    draftLockReleasers.set(draftId, resolve);
++  });
++}
++
++function releaseDraftLock(draftId: string): void {
++  const release = draftLockReleasers.get(draftId);
++  draftLockReleasers.delete(draftId);
++  release?.();
++}
++
 +function releaseDraftAfterSave(draftId: string | undefined): void {
 +  if (!draftId) return;
 +  activeDraftIds.delete(draftId);
++  releaseDraftLock(draftId);
 +  void enqueueDraftTask((store) => deleteDraftRows(store, draftId));
 +}
 +
@@ -977,7 +2059,9 @@ index 732aa9ff1..67572ec17 100644
 +  for (const [draftId, rows] of groups) {
 +    rows.sort((left, right) => left.seq - right.seq);
 +    const newest = Math.max(...rows.map((row) => row.updatedAt));
-+    if (now - newest < DRAFT_RECOVERY_MIN_AGE_MS) {
++    const lockFree = await isDraftLockFree(draftId);
++    if (lockFree === false) continue;
++    if (lockFree === null && now - newest < DRAFT_RECOVERY_MIN_AGE_MS) {
 +      scheduleDraftRecovery(
 +        key,
 +        DRAFT_RECOVERY_MIN_AGE_MS - (now - newest) + 1_000,
@@ -1041,7 +2125,49 @@ index 732aa9ff1..67572ec17 100644
  function notify(key: string): void {
    snapshots.delete(key);
    for (const listener of [...listeners]) listener();
-@@ -124,6 +313,9 @@ function hydrate(key: string): void {
+@@ -104,26 +371,48 @@ function hydrate(key: string): void {
+       (storedKey) => Array.isArray(storedKey) && storedKey[0] === key,
+     );
+     let restored = false;
++    const transcripts = transcriptStore();
++    const savedTexts = transcripts
++      ? await getMany<unknown>(storedKeys, transcripts).catch(() => [])
++      : [];
++    const textById = new Map<string, string>();
++    storedKeys.forEach((storedKey, index) => {
++      const text = savedTexts[index];
++      if (Array.isArray(storedKey) && typeof text === "string" && text) {
++        textById.set(String(storedKey[1]), text);
++      }
++    });
+     for (const row of await getMany<unknown>(storedKeys, store)) {
+       const parsed = storedRecordingSchema.safeParse(row);
+       if (!parsed.success || entries.has(parsed.data.id)) continue;
+-      const { audio, mimeType, fileName, promptContext, ...recording } =
+-        parsed.data;
++      const {
++        audio,
++        mimeType,
++        fileName,
++        promptContext,
++        transcript: storedTranscript,
++        ...recording
++      } = parsed.data;
++      const transcript = textById.get(recording.id) ?? storedTranscript;
+       entries.set(recording.id, {
+         recording: {
+           ...recording,
+           file: new File([audio], fileName, { type: mimeType }),
+           promptContext: promptContext ?? undefined,
++          ...(transcript ? { transcript } : {}),
+         },
+         persisted: true,
+         retryController: null,
+         status: "failed",
+-        errorMessage: null,
++        errorMessage: transcript ? TRANSCRIPT_READY_MESSAGE : null,
+       });
+       restored = true;
      }
      if (restored) notify(key);
    });
@@ -1051,7 +2177,7 @@ index 732aa9ff1..67572ec17 100644
  }
  
  export function useFailedVoiceRecordings(
-@@ -142,12 +334,14 @@ export function useFailedVoiceRecordings(
+@@ -142,12 +431,14 @@ export function useFailedVoiceRecordings(
  
  export function saveVoiceRecording(
    recording: Omit<VoiceRecording, "id" | "createdAt">,
@@ -1068,7 +2194,7 @@ index 732aa9ff1..67572ec17 100644
      createdAt,
    };
    entries.set(saved.id, {
-@@ -159,8 +353,12 @@ export function saveVoiceRecording(
+@@ -159,8 +450,12 @@ export function saveVoiceRecording(
    });
    notify(saved.key);
    if (options.persist) {
@@ -1082,17 +2208,114 @@ index 732aa9ff1..67572ec17 100644
        const stored: StoredRecording = {
          id: saved.id,
          key: saved.key,
-@@ -172,7 +370,13 @@ export function saveVoiceRecording(
+@@ -172,11 +467,52 @@ export function saveVoiceRecording(
          createdAt: saved.createdAt,
        };
        await set([saved.key, saved.id], stored, store);
 +      durable = true;
 +    }).then(() => {
 +      if (durable) releaseDraftAfterSave(options.draftId);
-+      else if (options.draftId) activeDraftIds.delete(options.draftId);
++      else if (options.draftId) {
++        activeDraftIds.delete(options.draftId);
++        releaseDraftLock(options.draftId);
++      }
      });
 +  } else {
 +    releaseDraftAfterSave(options.draftId);
    }
    return saved;
  }
+ 
++let transcriptDatabase: UseStore | null | undefined;
++
++function transcriptStore(): UseStore | null {
++  if (transcriptDatabase === undefined) {
++    transcriptDatabase =
++      typeof indexedDB === "undefined"
++        ? null
++        : createStore("bb-voice-transcripts", "transcripts");
++  }
++  return transcriptDatabase;
++}
++
++export async function recordVoiceTranscript(
++  id: string,
++  transcript: string,
++): Promise<boolean> {
++  const entry = entries.get(id);
++  if (!entry) return false;
++  entry.recording = { ...entry.recording, transcript };
++  const store = transcriptStore();
++  if (!entry.persisted || !store) return false;
++  for (let attempt = 0; attempt < 2; attempt += 1) {
++    try {
++      await set([entry.recording.key, id], transcript, store);
++      return true;
++    } catch {
++      continue;
++    }
++  }
++  return false;
++}
++
+ export function startVoiceRecordingRetry(id: string): AbortSignal | null {
+   const entry = entries.get(id);
+   if (!entry || entry.status !== "failed") return null;
+@@ -216,6 +552,10 @@ export function deleteVoiceRecording(id: string): Promise<void> {
+   entry.retryController?.abort();
+   notify(entry.recording.key);
+   if (!entry.persisted) return Promise.resolve();
++  const transcripts = transcriptStore();
++  if (transcripts) {
++    void del([entry.recording.key, id], transcripts).catch(() => {});
++  }
+   return enqueueDatabaseTask((store) => del([entry.recording.key, id], store));
+ }
+ 
+diff --git a/packages/plugin-sdk/src/app-contract.ts b/packages/plugin-sdk/src/app-contract.ts
+index 543f65f28..430a92939 100644
+--- a/packages/plugin-sdk/src/app-contract.ts
++++ b/packages/plugin-sdk/src/app-contract.ts
+@@ -3003,6 +3003,8 @@ export interface ExperimentalFailedVoiceRecording {
+   createdAt: number;
+   errorMessage: string | null;
+   retrying: boolean;
++  /** Text already transcribed but not yet confirmed as inserted. */
++  transcript?: string;
+ }
+ 
+ /** bb's voice input for the composer. */
+@@ -3014,6 +3016,8 @@ export interface ExperimentalComposerVoice {
+   /** Why voice input is unavailable, as a message safe to show; read it only while `isSupported` is false. */
+   unsupportedMessage: string;
+   stream: MediaStream | null;
++  /** Words recognized so far while recording, when live transcription runs. */
++  liveText?: string;
+   failedRecordings: readonly ExperimentalFailedVoiceRecording[];
+   start(): void | Promise<void>;
+   stop(): void;
+diff --git a/plugins/composer/src/PromptBoxInternal.tsx b/plugins/composer/src/PromptBoxInternal.tsx
+index 2037ab263..91363459a 100644
+--- a/plugins/composer/src/PromptBoxInternal.tsx
++++ b/plugins/composer/src/PromptBoxInternal.tsx
+@@ -3374,6 +3374,20 @@ export function PromptBoxInternal({
+           onDiscard={voice.discard}
+         />
+       ) : null}
++      {voice &&
++      (voice.state === "recording" || voice.state === "transcribing") &&
++      voice.liveText ? (
++        <div
++          data-promptbox-voice-live-text=""
++          aria-live="polite"
++          ref={(node) => {
++            if (node) node.scrollTop = node.scrollHeight;
++          }}
++          className="mx-1.5 mt-1.5 max-h-28 overflow-y-auto rounded-lg bg-muted px-3 py-2 text-sm leading-snug text-foreground/80"
++        >
++          {voice.liveText}
++        </div>
++      ) : null}
+       <div
+         data-promptbox-layout=""
+         className={cn(COLLAPSING_GRID_CLASS, showCompactLayout && "relative")}

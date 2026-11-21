@@ -134,7 +134,57 @@ async function scribe(
   return text.trim();
 }
 
+const LIVE_MODELS = ["scribe_v3_live", "scribe_v2_realtime"] as const;
+const LIVE_LANGUAGE = process.env.VOICE_LIVE_LANGUAGE?.trim() || "ru";
+const TOKEN_URL = "https://api.elevenlabs.io/v1/single-use-token/realtime_scribe";
+
+function json(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "content-type": "application/json", "cache-control": "no-store" },
+  });
+}
+
 export default function plugin(bb: BbPluginApi) {
+  bb.http.route(
+    "POST",
+    "/live-token",
+    async () => {
+      const key = await readKey();
+      if (!key) return json({ ok: false, error: `Missing ${KEY_NAME}` }, 503);
+      const response = await fetch(TOKEN_URL, {
+        method: "POST",
+        headers: { "xi-api-key": key },
+      });
+      const body = await response.text();
+      if (!response.ok) {
+        bb.log.warn(`live token failed: HTTP ${response.status} ${body.slice(0, 200)}`);
+        return json({ ok: false, error: `HTTP ${response.status}` }, 502);
+      }
+      const token = (JSON.parse(body) as { token?: unknown }).token;
+      if (typeof token !== "string") return json({ ok: false, error: "no token" }, 502);
+      return json({ ok: true, token, models: LIVE_MODELS, language: LIVE_LANGUAGE });
+    },
+    { auth: "local" },
+  );
+  bb.http.route(
+    "POST",
+    "/timing",
+    async (context) => {
+      const raw = (await context.req.json().catch(() => null)) as Record<string, unknown> | null;
+      if (raw && typeof raw === "object") {
+        const safe: Record<string, string | number | boolean> = {};
+        for (const [name, value] of Object.entries(raw).slice(0, 30)) {
+          if (typeof value === "number" || typeof value === "boolean") safe[name] = value;
+          else if (typeof value === "string") safe[name] = value.slice(0, 120);
+        }
+        bb.log.info(`voice timing ${JSON.stringify(safe)}`);
+      }
+      return json({ ok: true });
+    },
+    { auth: "local" },
+  );
+
   bb.experimental_aiServices.register({
     id: "elevenlabs",
     displayName: "ElevenLabs",
