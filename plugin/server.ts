@@ -124,7 +124,10 @@ async function scribe(
   });
   const body = await response.text();
   if (!response.ok) {
-    throw new Error(`${model}: HTTP ${response.status} ${body.slice(0, 200)}`);
+    throw Object.assign(
+      new Error(`${model}: HTTP ${response.status} ${body.slice(0, 200)}`),
+      { status: response.status },
+    );
   }
   const text = (JSON.parse(body) as { text?: unknown }).text;
   if (typeof text !== "string") throw new Error(`${model}: empty response`);
@@ -158,6 +161,8 @@ export default function plugin(bb: BbPluginApi) {
           const message = error instanceof Error ? error.message : String(error);
           errors.push(message);
           bb.log.warn(`voice attempt failed: ${message}`);
+          const status = (error as { status?: unknown }).status;
+          if (status === 401 || status === 402 || status === 403 || status === 429) break;
         }
       }
       throw new Error(`ElevenLabs transcription failed: ${errors.join(" | ")}`);

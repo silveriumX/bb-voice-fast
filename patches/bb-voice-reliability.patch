@@ -699,10 +699,10 @@ index 740b1934a..a8239eca1 100644
      void deleteVoiceRecording(recording.id);
    }, []);
 diff --git a/apps/app/src/lib/voice-recording-store.test.tsx b/apps/app/src/lib/voice-recording-store.test.tsx
-index 794840ad1..b82521367 100644
+index 794840ad1..06adbccf8 100644
 --- a/apps/app/src/lib/voice-recording-store.test.tsx
 +++ b/apps/app/src/lib/voice-recording-store.test.tsx
-@@ -94,3 +94,83 @@ it("leaves nothing stored once recordings are deleted, even before their saves f
+@@ -94,3 +94,131 @@ it("leaves nothing stored once recordings are deleted, even before their saves f
    expect(result.current).toEqual([]);
    expect(await keys(recordingsDatabase)).toEqual([]);
  });
@@ -786,8 +786,56 @@ index 794840ad1..b82521367 100644
 +    expect(await keys(draftsDatabase)).toHaveLength(0);
 +  });
 +});
++
++it("restores one recording, not two, when the page dies between the final save and the draft cleanup", async () => {
++  const before = await loadFreshStore();
++  const draft = before.beginVoiceDraft({
++    key: "thread/thr_crash",
++    mimeType: "audio/webm",
++    promptContext: undefined,
++  });
++  await draft.append([new Blob(["partial"])]);
++  const saved = before.saveVoiceRecording(
++    {
++      key: "thread/thr_crash",
++      file: recordingFile("full audio"),
++      promptContext: undefined,
++      delivery: "insert",
++    },
++    { persist: true, draftId: draft.id },
++  );
++  expect(saved.id).toBe(draft.id);
++  await waitFor(async () =>
++    expect(await keys(recordingsDatabase)).toHaveLength(1),
++  );
++  const { set } = await import("idb-keyval");
++  await set(
++    ["thread/thr_crash", draft.id, 0],
++    {
++      key: "thread/thr_crash",
++      draftId: draft.id,
++      seq: 0,
++      audio: await new Blob(["partial"]).arrayBuffer(),
++      mimeType: "audio/webm",
++      promptContext: null,
++      createdAt: 1,
++      updatedAt: 1,
++    },
++    draftsDatabase,
++  );
++
++  const after = await loadFreshStore();
++  const { result } = renderHook(() =>
++    after.useFailedVoiceRecordings("thread/thr_crash"),
++  );
++  await waitFor(async () =>
++    expect(await keys(draftsDatabase)).toHaveLength(0),
++  );
++  expect(result.current).toHaveLength(1);
++  expect(await result.current[0]?.file.text()).toBe("full audio");
++});
 diff --git a/apps/app/src/lib/voice-recording-store.ts b/apps/app/src/lib/voice-recording-store.ts
-index 732aa9ff1..774bd7413 100644
+index 732aa9ff1..67572ec17 100644
 --- a/apps/app/src/lib/voice-recording-store.ts
 +++ b/apps/app/src/lib/voice-recording-store.ts
 @@ -2,6 +2,7 @@ import { useSyncExternalStore } from "react";
@@ -1003,7 +1051,7 @@ index 732aa9ff1..774bd7413 100644
  }
  
  export function useFailedVoiceRecordings(
-@@ -142,7 +334,7 @@ export function useFailedVoiceRecordings(
+@@ -142,12 +334,14 @@ export function useFailedVoiceRecordings(
  
  export function saveVoiceRecording(
    recording: Omit<VoiceRecording, "id" | "createdAt">,
@@ -1012,7 +1060,15 @@ index 732aa9ff1..774bd7413 100644
  ): VoiceRecording {
    const createdAt = Date.now();
    const saved: VoiceRecording = {
-@@ -159,8 +351,12 @@ export function saveVoiceRecording(
+     ...recording,
+-    id: `${createdAt.toString(36)}-${Math.random().toString(36).slice(2)}`,
++    id:
++      options.draftId ??
++      `${createdAt.toString(36)}-${Math.random().toString(36).slice(2)}`,
+     createdAt,
+   };
+   entries.set(saved.id, {
+@@ -159,8 +353,12 @@ export function saveVoiceRecording(
    });
    notify(saved.key);
    if (options.persist) {
@@ -1026,7 +1082,7 @@ index 732aa9ff1..774bd7413 100644
        const stored: StoredRecording = {
          id: saved.id,
          key: saved.key,
-@@ -172,7 +368,13 @@ export function saveVoiceRecording(
+@@ -172,7 +370,13 @@ export function saveVoiceRecording(
          createdAt: saved.createdAt,
        };
        await set([saved.key, saved.id], stored, store);
