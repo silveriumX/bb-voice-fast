@@ -1,0 +1,1042 @@
+diff --git a/apps/app/src/components/promptbox/FailedVoiceRecordings.tsx b/apps/app/src/components/promptbox/FailedVoiceRecordings.tsx
+index ac45a09fa..b1ad8937d 100644
+--- a/apps/app/src/components/promptbox/FailedVoiceRecordings.tsx
++++ b/apps/app/src/components/promptbox/FailedVoiceRecordings.tsx
+@@ -38,12 +38,12 @@ export function FailedVoiceRecordings({
+       >
+         {recordings.map((recording) => {
+           const errorMessage =
+-            recording.errorMessage ?? "Transcription did not finish";
++            recording.errorMessage ?? "Расшифровка не завершилась";
+           return (
+             <div
+               key={recording.id}
+               role="group"
+-              aria-label="Voice input failed"
++              aria-label="Голосовая запись сохранена"
+               className="grid min-w-0 grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-x-1 rounded-lg bg-muted py-1 pl-2.5 pr-1 md:flex"
+             >
+               <Icon
+@@ -53,7 +53,7 @@ export function FailedVoiceRecordings({
+               <Tooltip>
+                 <TooltipTrigger asChild>
+                   <p className="flex min-w-0 flex-1 overflow-hidden whitespace-nowrap px-1 text-xs">
+-                    <span className="shrink-0">Voice input failed</span>
++                    <span className="shrink-0">Запись сохранена</span>
+                     <span className="min-w-0 truncate text-muted-foreground">
+                       &nbsp;· {errorMessage}
+                     </span>
+@@ -67,14 +67,14 @@ export function FailedVoiceRecordings({
+                     type="button"
+                     size="icon"
+                     variant="ghost"
+-                    aria-label="Discard recording"
++                    aria-label="Удалить запись"
+                     onClick={() => onDiscard(recording)}
+                     className={cn(ICON_BUTTON_CLASS, "md:order-last")}
+                   >
+                     <Icon name="X" className="size-3.5" />
+                   </Button>
+                 </TooltipTrigger>
+-                <TooltipContent side="top">Discard recording</TooltipContent>
++                <TooltipContent side="top">Удалить запись</TooltipContent>
+               </Tooltip>
+               <div className="col-start-2 flex items-center gap-1 pb-0.5 md:contents">
+                 <Button
+@@ -88,7 +88,7 @@ export function FailedVoiceRecordings({
+                     recording.retrying && "disabled:opacity-100",
+                   )}
+                 >
+-                  {recording.retrying ? "Retrying…" : "Retry"}
++                  {recording.retrying ? "Расшифровываю…" : "Повторить"}
+                 </Button>
+                 <Button
+                   type="button"
+@@ -97,7 +97,7 @@ export function FailedVoiceRecordings({
+                   onClick={() => onDownload(recording)}
+                   className={cn(ACTION_BUTTON_CLASS, "text-muted-foreground")}
+                 >
+-                  Download
++                  Скачать
+                 </Button>
+               </div>
+             </div>
+diff --git a/apps/app/src/hooks/useVoiceInput.test.tsx b/apps/app/src/hooks/useVoiceInput.test.tsx
+index 8c459800d..051a027ff 100644
+--- a/apps/app/src/hooks/useVoiceInput.test.tsx
++++ b/apps/app/src/hooks/useVoiceInput.test.tsx
+@@ -3,6 +3,7 @@
+ import { act, cleanup, renderHook } from "@testing-library/react";
+ import { afterEach, beforeEach, expect, it, vi } from "vitest";
+ import { appToast } from "@/components/ui/app-toast";
++import { HttpError } from "@/lib/api";
+ import { useAudioInputDevicePreferenceValue } from "@/lib/audio-input-device-preference";
+ import { saveFile } from "@/lib/save-file";
+ import { useVoiceInput } from "./useVoiceInput";
+@@ -66,6 +67,14 @@ beforeEach(() => {
+   });
+ });
+ 
++function finalFailure(message: string) {
++  return new HttpError({ status: 400, message });
++}
++
++async function runRetryTimers() {
++  await act(() => vi.advanceTimersByTimeAsync(20_000));
++}
++
+ afterEach(() => {
+   cleanup();
+   vi.useRealTimers();
+@@ -75,9 +84,18 @@ afterEach(() => {
+ });
+ 
+ it.each([
+-  new Error("Upload failed"),
+-  new Error("Audio file exceeds the 20MB limit"),
+-])("keeps failed audio in its composer after unmount: %s", async (error) => {
++  { error: new Error("Upload failed"), attempts: 4 },
++  {
++    error: new HttpError({
++      status: 413,
++      message: "Audio file exceeds the 20MB limit",
++    }),
++    attempts: 1,
++  },
++])("keeps failed audio in its composer after unmount: $error.message", async ({
++  error,
++  attempts,
++}) => {
+   const transcribe = vi.fn().mockRejectedValue(error);
+   const transcript = vi.fn();
+   const recordingKey = `thread/${error.message}`;
+@@ -91,6 +109,8 @@ it.each([
+   await act(() => result.current.start());
+   vi.advanceTimersByTime(1500);
+   await act(async () => result.current.stop("insert"));
++  await runRetryTimers();
++  expect(transcribe).toHaveBeenCalledTimes(attempts);
+   expect(result.current.state).toBe("idle");
+   expect(transcript).not.toHaveBeenCalled();
+   expect(appToast.error).not.toHaveBeenCalled();
+@@ -104,7 +124,10 @@ it.each([
+     }),
+   );
+   const [failed] = remounted.result.current.failedRecordings;
+-  expect(failed?.errorMessage).toBe(error.message);
++  expect(failed?.errorMessage).toBe(
++    error.message.replace(/^HTTP \d{3}: /, ""),
++  );
++  expect(transcribe).toHaveBeenCalledTimes(attempts);
+   expect(failed?.file).toBe(transcribe.mock.calls[0]?.[0].file);
+   if (!failed) throw new Error("Missing failed recording");
+   act(() => remounted.result.current.download(failed));
+@@ -121,7 +144,7 @@ it.each(["insert", "send"] as const)(
+   async (delivery) => {
+     const transcribe = vi
+       .fn()
+-      .mockRejectedValueOnce(new Error("the model did not answer in time"))
++      .mockRejectedValueOnce(finalFailure("the model did not answer in time"))
+       .mockResolvedValueOnce(" Retried words ");
+     const onTranscript = vi.fn();
+     const { result } = renderHook(() =>
+@@ -180,7 +203,7 @@ it("keeps the first completion choice when stop and send race", async () => {
+ it("retries in the banner while the composer stays free, and discarding stops the retry", async () => {
+   const transcribe = vi
+     .fn()
+-    .mockRejectedValueOnce(new Error("Service unavailable"))
++    .mockRejectedValueOnce(finalFailure("Service unavailable"))
+     .mockImplementationOnce(
+       ({ signal }: { signal: AbortSignal }) =>
+         new Promise<string>((_resolve, reject) => {
+@@ -224,7 +247,7 @@ it.each([false, true])(
+     let resolveRetry!: (text: string) => void;
+     const transcribe = vi
+       .fn()
+-      .mockRejectedValueOnce(new Error("Service unavailable"))
++      .mockRejectedValueOnce(finalFailure("Service unavailable"))
+       .mockImplementationOnce(
+         () =>
+           new Promise<string>((resolve) => {
+@@ -278,7 +301,7 @@ it("delivers a live transcript after the completion transition, but never animat
+   const transcribe = vi
+     .fn()
+     .mockResolvedValueOnce("Live words")
+-    .mockRejectedValueOnce(new Error("Service unavailable"))
++    .mockRejectedValueOnce(finalFailure("Service unavailable"))
+     .mockResolvedValueOnce("Retried words");
+   const onTranscript = vi.fn();
+   const { result } = renderHook(() =>
+@@ -307,24 +330,94 @@ it("delivers a live transcript after the completion transition, but never animat
+   expect(playCompletionTransition).toHaveBeenCalledOnce();
+ });
+ 
+-it("discards the recording when the user cancels its first transcription", async () => {
++it("keeps the recording when the user cancels its first transcription", async () => {
++  const onTranscribe = vi.fn(
++    ({ signal }: { signal?: AbortSignal }) =>
++      new Promise<string>((_resolve, reject) => {
++        signal?.addEventListener("abort", () =>
++          reject(new DOMException("Cancelled", "AbortError")),
++        );
++      }),
++  );
+   const { result } = renderHook(() =>
+     useVoiceInput({
+       recordingKey: "thread/cancelled",
+-      onTranscribe: vi
+-        .fn()
+-        .mockRejectedValue(new DOMException("Cancelled", "AbortError")),
++      onTranscribe,
+       onTranscript: vi.fn(),
+     }),
+   );
+   await act(() => result.current.start());
+   vi.advanceTimersByTime(1500);
+   await act(async () => result.current.stop("insert"));
++  await act(async () => result.current.cancel());
++  await runRetryTimers();
+   expect(result.current.state).toBe("idle");
+-  expect(result.current.failedRecordings).toEqual([]);
++  expect(result.current.failedRecordings).toEqual([
++    expect.objectContaining({
++      errorMessage: "Расшифровка остановлена — запись сохранена",
++      retrying: false,
++    }),
++  ]);
++  expect(onTranscribe).toHaveBeenCalledOnce();
+   expect(appToast.error).not.toHaveBeenCalled();
+ });
+ 
++it("retries a dropped connection by itself and inserts the text", async () => {
++  const transcribe = vi
++    .fn()
++    .mockRejectedValueOnce(new TypeError("Failed to fetch"))
++    .mockRejectedValueOnce(new HttpError({ status: 502, message: "Bad gateway" }))
++    .mockResolvedValueOnce("Saved words");
++  const onTranscript = vi.fn();
++  const { result } = renderHook(() =>
++    useVoiceInput({
++      recordingKey: "thread/auto-retry",
++      onTranscribe: transcribe,
++      onTranscript,
++    }),
++  );
++  await act(() => result.current.start());
++  vi.advanceTimersByTime(1500);
++  await act(async () => result.current.stop("send"));
++  expect(result.current.state).toBe("transcribing");
++  await runRetryTimers();
++  expect(transcribe).toHaveBeenCalledTimes(3);
++  expect(transcribe.mock.calls[2]?.[0].file).toBe(
++    transcribe.mock.calls[0]?.[0].file,
++  );
++  expect(onTranscript).toHaveBeenCalledExactlyOnceWith("Saved words", "send");
++  expect(result.current.failedRecordings).toEqual([]);
++  expect(result.current.state).toBe("idle");
++});
++
++it("gives up on a hung request after its timeout and tries again", async () => {
++  const transcribe = vi
++    .fn()
++    .mockImplementationOnce(
++      ({ signal }: { signal?: AbortSignal }) =>
++        new Promise<string>((_resolve, reject) => {
++          signal?.addEventListener("abort", () =>
++            reject(new DOMException("Aborted", "AbortError")),
++          );
++        }),
++    )
++    .mockResolvedValueOnce("After timeout");
++  const onTranscript = vi.fn();
++  const { result } = renderHook(() =>
++    useVoiceInput({
++      recordingKey: "thread/hung",
++      onTranscribe: transcribe,
++      onTranscript,
++    }),
++  );
++  await act(() => result.current.start());
++  vi.advanceTimersByTime(1500);
++  await act(async () => result.current.stop("insert"));
++  await act(() => vi.advanceTimersByTimeAsync(60_000));
++  expect(transcribe).toHaveBeenCalledTimes(2);
++  expect(onTranscript).toHaveBeenCalledExactlyOnceWith("After timeout", "insert");
++});
++
+ it("tells the user where a recording went when it fails after its composer unmounts", async () => {
+   let failTranscription: ((error: Error) => void) | undefined;
+   const onTranscribe = vi.fn(
+@@ -343,11 +436,15 @@ it("tells the user where a recording went when it fails after its composer unmou
+   vi.advanceTimersByTime(1500);
+   await act(async () => result.current.stop("send"));
+   unmount();
+-  await act(async () => failTranscription?.(new Error("HTTP 500: ASR down")));
++  for (let attempt = 0; attempt < 4; attempt += 1) {
++    await act(async () => failTranscription?.(new Error("HTTP 500: ASR down")));
++    await runRetryTimers();
++  }
++  expect(onTranscribe).toHaveBeenCalledTimes(4);
+   expect(appToast.error).toHaveBeenCalledWith(
+-    "Couldn't transcribe your recording",
++    "Не удалось расшифровать запись",
+     expect.objectContaining({
+-      description: "It's saved in its composer so you can retry.",
++      description: "Она сохранена в окне ввода — можно повторить.",
+     }),
+   );
+ 
+diff --git a/apps/app/src/hooks/useVoiceInput.ts b/apps/app/src/hooks/useVoiceInput.ts
+index 740b1934a..a8239eca1 100644
+--- a/apps/app/src/hooks/useVoiceInput.ts
++++ b/apps/app/src/hooks/useVoiceInput.ts
+@@ -4,7 +4,9 @@ import { useMicrophoneSignal } from "./useMicrophoneSignal";
+ import { useAudioInputDevices } from "./useAudioInputDevices";
+ import { appToast } from "@/components/ui/app-toast";
+ import { saveFile } from "@/lib/save-file";
++import { HttpError } from "@/lib/api";
+ import {
++  beginVoiceDraft,
+   deleteVoiceRecording,
+   deleteVoiceRecordingsForKey,
+   failVoiceRecording,
+@@ -14,6 +16,7 @@ import {
+   useFailedVoiceRecordings,
+   type FailedVoiceRecording,
+   type VoiceDelivery,
++  type VoiceDraftHandle,
+   type VoiceRecording,
+ } from "@/lib/voice-recording-store";
+ import {
+@@ -51,10 +54,123 @@ interface UseVoiceInputOptions {
+ type TranscriptionResult =
+   | { kind: "transcript"; text: string }
+   | { kind: "cancelled" }
+-  | { kind: "failed"; message: string };
++  | { kind: "failed"; message: string; retryable: boolean };
+ 
+ const MIN_RECORDING_DURATION_MS = 1_000;
+ const CHUNK_TIMESLICE_MS = 250;
++const DRAFT_FLUSH_INTERVAL_MS = 2_000;
++const TRANSCRIPTION_RETRY_DELAYS_MS = [1_500, 4_000, 10_000];
++const TRANSCRIPTION_BASE_TIMEOUT_MS = 45_000;
++const TRANSCRIPTION_TIMEOUT_PER_MB_MS = 20_000;
++const TRANSCRIPTION_MAX_TIMEOUT_MS = 20 * 60_000;
++const OFFLINE_WAIT_MAX_MS = 60_000;
++const CANCELLED_TRANSCRIPTION_MESSAGE =
++  "Расшифровка остановлена — запись сохранена";
++const NON_RETRYABLE_STATUSES = new Set([400, 401, 403, 404, 413, 422, 501]);
++
++const autoRetriedRecordingIds = new Set<string>();
++const noAutoRetryRecordingIds = new Set<string>();
++
++class TranscriptionTimeoutError extends Error {
++  constructor() {
++    super("Компьютер не ответил вовремя — запись сохранена");
++    this.name = "TranscriptionTimeoutError";
++  }
++}
++
++function isRetryableTranscriptionError(error: unknown): boolean {
++  if (error instanceof HttpError) {
++    return !NON_RETRYABLE_STATUSES.has(error.status);
++  }
++  if (
++    error instanceof Error &&
++    error.message === "Voice transcription returned an empty result."
++  ) {
++    return false;
++  }
++  return true;
++}
++
++function waitFor(ms: number, signal: AbortSignal): Promise<void> {
++  return new Promise((resolve) => {
++    if (signal.aborted) return resolve();
++    const timer = setTimeout(done, ms);
++    function done() {
++      clearTimeout(timer);
++      signal.removeEventListener("abort", done);
++      resolve();
++    }
++    signal.addEventListener("abort", done, { once: true });
++  });
++}
++
++function waitForOnline(signal: AbortSignal): Promise<void> {
++  if (
++    typeof navigator === "undefined" ||
++    typeof window === "undefined" ||
++    navigator.onLine !== false
++  ) {
++    return Promise.resolve();
++  }
++  return new Promise((resolve) => {
++    const timer = setTimeout(done, OFFLINE_WAIT_MAX_MS);
++    function done() {
++      clearTimeout(timer);
++      window.removeEventListener("online", done);
++      signal.removeEventListener("abort", done);
++      resolve();
++    }
++    window.addEventListener("online", done, { once: true });
++    signal.addEventListener("abort", done, { once: true });
++  });
++}
++
++async function transcribeWithRetry(
++  onTranscribe: UseVoiceInputOptions["onTranscribe"],
++  recording: VoiceRecording,
++  signal: AbortSignal,
++): Promise<string> {
++  const timeoutMs = Math.min(
++    TRANSCRIPTION_MAX_TIMEOUT_MS,
++    TRANSCRIPTION_BASE_TIMEOUT_MS +
++      (recording.file.size / (1024 * 1024)) * TRANSCRIPTION_TIMEOUT_PER_MB_MS,
++  );
++  let lastError: unknown = null;
++  for (
++    let attempt = 0;
++    attempt <= TRANSCRIPTION_RETRY_DELAYS_MS.length;
++    attempt += 1
++  ) {
++    if (attempt > 0) {
++      await waitFor(TRANSCRIPTION_RETRY_DELAYS_MS[attempt - 1]!, signal);
++      await waitForOnline(signal);
++    }
++    if (signal.aborted) break;
++    const attemptController = new AbortController();
++    const abortAttempt = () => attemptController.abort();
++    signal.addEventListener("abort", abortAttempt, { once: true });
++    let timedOut = false;
++    const timer = setTimeout(() => {
++      timedOut = true;
++      attemptController.abort();
++    }, timeoutMs);
++    try {
++      return await onTranscribe({
++        file: recording.file,
++        promptContext: recording.promptContext,
++        signal: attemptController.signal,
++      });
++    } catch (error) {
++      if (signal.aborted) throw error;
++      lastError = timedOut ? new TranscriptionTimeoutError() : error;
++      if (!timedOut && !isRetryableTranscriptionError(error)) throw error;
++    } finally {
++      clearTimeout(timer);
++      signal.removeEventListener("abort", abortAttempt);
++    }
++  }
++  throw lastError ?? new DOMException("Aborted", "AbortError");
++}
+ let nextEphemeralRecordingKey = 0;
+ 
+ const HTML_DOCUMENT_PATTERN = /<!doctype html|<html[\s>]/i;
+@@ -156,6 +272,11 @@ export function useVoiceInput(options: UseVoiceInputOptions) {
+   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+   const streamRef = useRef<MediaStream | null>(null);
+   const chunksRef = useRef<Blob[]>([]);
++  const draftRef = useRef<VoiceDraftHandle | null>(null);
++  const pendingDraftChunksRef = useRef<Blob[]>([]);
++  const draftFlushTimerRef = useRef<ReturnType<typeof setInterval> | null>(
++    null,
++  );
+   const startedAtMsRef = useRef<number | null>(null);
+   const promptContextRef = useRef<string | undefined>(undefined);
+   const shouldTranscribeRef = useRef(true);
+@@ -216,7 +337,7 @@ export function useVoiceInput(options: UseVoiceInputOptions) {
+ 
+   const showError = useCallback((message: string) => {
+     setState("error");
+-    appToast.error("Voice input failed", { description: message });
++    appToast.error("Голосовой ввод", { description: message });
+   }, []);
+ 
+   const stopMediaStream = useCallback(() => {
+@@ -230,6 +351,45 @@ export function useVoiceInput(options: UseVoiceInputOptions) {
+     setStream(null);
+   }, []);
+ 
++  const flushDraft = useCallback(() => {
++    const draft = draftRef.current;
++    const pending = pendingDraftChunksRef.current;
++    if (!draft || pending.length === 0) return;
++    pendingDraftChunksRef.current = [];
++    void draft.append(pending);
++  }, []);
++
++  const closeDraft = useCallback(
++    (mode: "keep" | "discard") => {
++      if (draftFlushTimerRef.current !== null) {
++        clearInterval(draftFlushTimerRef.current);
++        draftFlushTimerRef.current = null;
++      }
++      const draft = draftRef.current;
++      draftRef.current = null;
++      pendingDraftChunksRef.current = [];
++      if (!draft) return undefined;
++      if (mode === "discard") void draft.discard();
++      return draft.id;
++    },
++    [],
++  );
++
++  useEffect(() => {
++    if (typeof document === "undefined" || typeof window === "undefined") {
++      return;
++    }
++    const onHide = () => {
++      if (document.visibilityState === "hidden") flushDraft();
++    };
++    document.addEventListener("visibilitychange", onHide);
++    window.addEventListener("pagehide", flushDraft);
++    return () => {
++      document.removeEventListener("visibilitychange", onHide);
++      window.removeEventListener("pagehide", flushDraft);
++    };
++  }, [flushDraft]);
++
+   const switchMicrophone = useCallback(
+     async (deviceId: string | null) => {
+       const recordingStream = recordingStreamRef.current;
+@@ -382,6 +542,7 @@ export function useVoiceInput(options: UseVoiceInputOptions) {
+       }
+       const acceptedRecordingPending = acceptedRecordingPendingRef.current;
+       mediaRecorderRef.current = null;
++      if (!acceptedRecordingPending) closeDraft("discard");
+       if (!acceptedRecordingPending) {
+         chunksRef.current = [];
+         startedAtMsRef.current = null;
+@@ -390,7 +551,7 @@ export function useVoiceInput(options: UseVoiceInputOptions) {
+       releaseRecordingWakeLock();
+       if (!acceptedRecordingPending) stopMediaStream();
+     };
+-  }, [releaseRecordingWakeLock, stopMediaStream]);
++  }, [closeDraft, releaseRecordingWakeLock, stopMediaStream]);
+ 
+   useEffect(() => {
+     mountedRef.current = true;
+@@ -419,11 +580,11 @@ export function useVoiceInput(options: UseVoiceInputOptions) {
+       beforeDelivery: (() => Promise<void> | undefined) | undefined,
+     ): Promise<TranscriptionResult> => {
+       try {
+-        const transcript = await options.onTranscribe({
+-          file: recording.file,
+-          promptContext: recording.promptContext,
++        const transcript = await transcribeWithRetry(
++          options.onTranscribe,
++          recording,
+           signal,
+-        });
++        );
+         const text = normalizeTranscript(transcript);
+         if (!signal.aborted && text.length === 0) {
+           throw new Error("Voice transcription returned an empty result.");
+@@ -436,7 +597,11 @@ export function useVoiceInput(options: UseVoiceInputOptions) {
+         return signal.aborted ||
+           (error instanceof DOMException && error.name === "AbortError")
+           ? { kind: "cancelled" }
+-          : { kind: "failed", message: resolveRecordingErrorMessage(error) };
++          : {
++              kind: "failed",
++              message: resolveRecordingErrorMessage(error),
++              retryable: isRetryableTranscriptionError(error),
++            };
+       }
+     },
+     [options],
+@@ -446,28 +611,34 @@ export function useVoiceInput(options: UseVoiceInputOptions) {
+     async (
+       recording: VoiceRecording,
+       result: TranscriptionResult,
+-      onCancel: "discard" | "keep",
++      onCancel: "discard" | "keep" | "save",
+     ) => {
+       if (result.kind === "cancelled") {
+         if (onCancel === "discard") {
+           void deleteVoiceRecording(recording.id);
++        } else if (onCancel === "save") {
++          autoRetriedRecordingIds.add(recording.id);
++          noAutoRetryRecordingIds.add(recording.id);
++          failVoiceRecording(recording.id, CANCELLED_TRANSCRIPTION_MESSAGE);
+         }
+         return;
+       }
+       if (result.kind === "failed") {
++        autoRetriedRecordingIds.add(recording.id);
++        if (!result.retryable) noAutoRetryRecordingIds.add(recording.id);
+         if (mountedRef.current) {
+           failVoiceRecording(recording.id, result.message);
+         } else if (persistRecordings) {
+           failVoiceRecording(recording.id, result.message);
+-          appToast.error("Couldn't transcribe your recording", {
+-            description: "It's saved in its composer so you can retry.",
++          appToast.error("Не удалось расшифровать запись", {
++            description: "Она сохранена в окне ввода — можно повторить.",
+           });
+         } else {
+           void deleteVoiceRecording(recording.id);
+         }
+         return;
+       }
+-      void deleteVoiceRecording(recording.id);
++      await deleteVoiceRecording(recording.id);
+       try {
+         await options.onTranscript(result.text, recording.delivery);
+       } catch (error) {
+@@ -493,7 +664,7 @@ export function useVoiceInput(options: UseVoiceInputOptions) {
+       if (transcriptionAbortRef.current === abortController) {
+         transcriptionAbortRef.current = null;
+       }
+-      await settleTranscription(recording, result, "discard");
++      await settleTranscription(recording, result, "save");
+       setState("idle");
+     },
+     [options, runTranscription, settleTranscription],
+@@ -558,6 +729,18 @@ export function useVoiceInput(options: UseVoiceInputOptions) {
+         ? new MediaRecorder(recorderInput, { mimeType: preferredMimeType })
+         : new MediaRecorder(recorderInput);
+       mediaRecorderRef.current = recorder;
++      closeDraft("discard");
++      if (persistRecordings) {
++        draftRef.current = beginVoiceDraft({
++          key: recordingKey,
++          mimeType: recorder.mimeType || preferredMimeType || "audio/webm",
++          promptContext: promptContextRef.current,
++        });
++        draftFlushTimerRef.current = setInterval(
++          flushDraft,
++          DRAFT_FLUSH_INTERVAL_MS,
++        );
++      }
+ 
+       recorder.onstart = () => {
+         setState("recording");
+@@ -566,6 +749,7 @@ export function useVoiceInput(options: UseVoiceInputOptions) {
+       recorder.ondataavailable = (event: BlobEvent) => {
+         if (event.data.size > 0) {
+           chunksRef.current.push(event.data);
++          if (draftRef.current) pendingDraftChunksRef.current.push(event.data);
+         }
+       };
+ 
+@@ -579,6 +763,7 @@ export function useVoiceInput(options: UseVoiceInputOptions) {
+         stopMediaStream();
+ 
+         if (!shouldTranscribeRef.current) {
++          closeDraft("discard");
+           shouldTranscribeRef.current = true;
+           chunksRef.current = [];
+           promptContextRef.current = undefined;
+@@ -591,6 +776,7 @@ export function useVoiceInput(options: UseVoiceInputOptions) {
+         const durationMs = Date.now() - startedAtMs;
+ 
+         if (durationMs < MIN_RECORDING_DURATION_MS) {
++          closeDraft("discard");
+           showError("Recording too short (minimum 1 second)");
+           chunksRef.current = [];
+           promptContextRef.current = undefined;
+@@ -600,6 +786,7 @@ export function useVoiceInput(options: UseVoiceInputOptions) {
+         const chunks = chunksRef.current;
+         chunksRef.current = [];
+         if (chunks.length === 0) {
++          closeDraft("discard");
+           showError("No audio was captured");
+           promptContextRef.current = undefined;
+           return;
+@@ -619,13 +806,14 @@ export function useVoiceInput(options: UseVoiceInputOptions) {
+             promptContext,
+             delivery: deliveryRef.current,
+           },
+-          { persist: persistRecordings },
++          { persist: persistRecordings, draftId: closeDraft("keep") },
+         );
+         await transcribeRecording(recording);
+       };
+ 
+       recorder.start(CHUNK_TIMESLICE_MS);
+     } catch (error) {
++      closeDraft("discard");
+       stopMediaStream();
+       mediaRecorderRef.current = null;
+       chunksRef.current = [];
+@@ -645,6 +833,8 @@ export function useVoiceInput(options: UseVoiceInputOptions) {
+       startingRef.current = false;
+     }
+   }, [
++    closeDraft,
++    flushDraft,
+     isSupported,
+     options,
+     unsupportedReason,
+@@ -696,6 +886,27 @@ export function useVoiceInput(options: UseVoiceInputOptions) {
+     [runTranscription, settleTranscription],
+   );
+ 
++  useEffect(() => {
++    const autoRetry = (force: boolean) => {
++      for (const recording of failedRecordings) {
++        if (
++          recording.retrying ||
++          noAutoRetryRecordingIds.has(recording.id)
++        ) {
++          continue;
++        }
++        if (!force && autoRetriedRecordingIds.has(recording.id)) continue;
++        autoRetriedRecordingIds.add(recording.id);
++        retry({ ...recording, delivery: "insert" });
++      }
++    };
++    autoRetry(false);
++    if (typeof window === "undefined") return;
++    const onOnline = () => autoRetry(true);
++    window.addEventListener("online", onOnline);
++    return () => window.removeEventListener("online", onOnline);
++  }, [failedRecordings, retry]);
++
+   const discard = useCallback((recording: FailedVoiceRecording) => {
+     void deleteVoiceRecording(recording.id);
+   }, []);
+diff --git a/apps/app/src/lib/voice-recording-store.test.tsx b/apps/app/src/lib/voice-recording-store.test.tsx
+index 794840ad1..b82521367 100644
+--- a/apps/app/src/lib/voice-recording-store.test.tsx
++++ b/apps/app/src/lib/voice-recording-store.test.tsx
+@@ -94,3 +94,83 @@ it("leaves nothing stored once recordings are deleted, even before their saves f
+   expect(result.current).toEqual([]);
+   expect(await keys(recordingsDatabase)).toEqual([]);
+ });
++
++const draftsDatabase = createStore("bb-voice-drafts", "chunks");
++
++afterEach(() => clear(draftsDatabase));
++
++it("recovers a recording interrupted mid-speech after a reload", async () => {
++  const before = await loadFreshStore();
++  const draft = before.beginVoiceDraft({
++    key: "thread/thr_draft",
++    mimeType: "audio/webm",
++    promptContext: "earlier text",
++  });
++  await draft.append([new Blob(["first "]), new Blob(["second "])]);
++  await draft.append([new Blob(["third"])]);
++  expect(await keys(draftsDatabase)).toHaveLength(2);
++
++  const realNow = Date.now();
++  const now = vi.spyOn(Date, "now").mockReturnValue(realNow + 60_000);
++  const after = await loadFreshStore();
++  const { result } = renderHook(() =>
++    after.useFailedVoiceRecordings("thread/thr_draft"),
++  );
++  await waitFor(() => expect(result.current).toHaveLength(1));
++  now.mockRestore();
++  const [recovered] = result.current;
++  expect(recovered).toMatchObject({
++    id: draft.id,
++    key: "thread/thr_draft",
++    promptContext: "earlier text",
++    delivery: "insert",
++    errorMessage: "Запись прервалась — сохранена, расшифровываю заново",
++  });
++  expect(await recovered?.file.text()).toBe("first second third");
++  await waitFor(async () =>
++    expect(await keys(draftsDatabase)).toHaveLength(0),
++  );
++  expect(await keys(recordingsDatabase)).toHaveLength(1);
++});
++
++it("does not recover a draft that is still being written", async () => {
++  const before = await loadFreshStore();
++  const draft = before.beginVoiceDraft({
++    key: "thread/thr_live",
++    mimeType: "audio/webm",
++    promptContext: undefined,
++  });
++  await draft.append([new Blob(["live"])]);
++  const after = await loadFreshStore();
++  const { result } = renderHook(() =>
++    after.useFailedVoiceRecordings("thread/thr_live"),
++  );
++  await act(async () => {
++    await new Promise((resolve) => setTimeout(resolve, 50));
++  });
++  expect(result.current).toEqual([]);
++  expect(await keys(draftsDatabase)).toHaveLength(1);
++});
++
++it("drops the draft once the finished recording is saved", async () => {
++  const store = await loadFreshStore();
++  const draft = store.beginVoiceDraft({
++    key: "thread/thr_saved",
++    mimeType: "audio/webm",
++    promptContext: undefined,
++  });
++  await draft.append([new Blob(["audio"])]);
++  store.saveVoiceRecording(
++    {
++      key: "thread/thr_saved",
++      file: recordingFile("audio"),
++      promptContext: undefined,
++      delivery: "insert",
++    },
++    { persist: true, draftId: draft.id },
++  );
++  await waitFor(async () => {
++    expect(await keys(recordingsDatabase)).toHaveLength(1);
++    expect(await keys(draftsDatabase)).toHaveLength(0);
++  });
++});
+diff --git a/apps/app/src/lib/voice-recording-store.ts b/apps/app/src/lib/voice-recording-store.ts
+index 732aa9ff1..774bd7413 100644
+--- a/apps/app/src/lib/voice-recording-store.ts
++++ b/apps/app/src/lib/voice-recording-store.ts
+@@ -2,6 +2,7 @@ import { useSyncExternalStore } from "react";
+ import {
+   createStore,
+   del,
++  delMany,
+   getMany,
+   keys,
+   set,
+@@ -71,6 +72,194 @@ function enqueueDatabaseTask(
+   return databaseQueue;
+ }
+ 
++const DRAFT_RECOVERY_MIN_AGE_MS = 20_000;
++const RECOVERED_DRAFT_MESSAGE =
++  "Запись прервалась — сохранена, расшифровываю заново";
++const draftStoredChunkSchema = z.object({
++  key: z.string().min(1),
++  draftId: z.string().min(1),
++  seq: z.number(),
++  audio: z.custom<ArrayBuffer>(
++    (value) => Object.prototype.toString.call(value) === "[object ArrayBuffer]",
++  ),
++  mimeType: z.string(),
++  promptContext: z.string().nullable(),
++  createdAt: z.number(),
++  updatedAt: z.number(),
++});
++let draftDatabase: UseStore | null | undefined;
++const activeDraftIds = new Set<string>();
++
++function enqueueDraftTask(
++  task: (store: UseStore, recordings: UseStore | null) => Promise<void>,
++): Promise<void> {
++  if (draftDatabase === undefined) {
++    draftDatabase =
++      typeof indexedDB === "undefined"
++        ? null
++        : createStore("bb-voice-drafts", "chunks");
++  }
++  const store = draftDatabase;
++  if (!store) return databaseQueue;
++  return enqueueDatabaseTask(async (recordings) => task(store, recordings));
++}
++
++async function deleteDraftRows(store: UseStore, draftId: string) {
++  const rows = (await keys<IDBValidKey>(store)).filter(
++    (storedKey) => Array.isArray(storedKey) && storedKey[1] === draftId,
++  );
++  if (rows.length > 0) await delMany(rows, store);
++}
++
++export interface VoiceDraftHandle {
++  readonly id: string;
++  append(chunks: readonly Blob[]): Promise<void>;
++  discard(): Promise<void>;
++}
++
++export function beginVoiceDraft(args: {
++  key: string;
++  mimeType: string;
++  promptContext: string | undefined;
++}): VoiceDraftHandle {
++  const createdAt = Date.now();
++  const id = `draft-${createdAt.toString(36)}-${Math.random().toString(36).slice(2)}`;
++  activeDraftIds.add(id);
++  let seq = 0;
++  let closed = false;
++  return {
++    id,
++    append(chunks) {
++      if (closed || chunks.length === 0) return Promise.resolve();
++      const blob = new Blob([...chunks], { type: args.mimeType });
++      const index = seq++;
++      return enqueueDraftTask(async (store) => {
++        if (closed) return;
++        await set(
++          [args.key, id, index],
++          {
++            key: args.key,
++            draftId: id,
++            seq: index,
++            audio: await blob.arrayBuffer(),
++            mimeType: args.mimeType,
++            promptContext: args.promptContext ?? null,
++            createdAt,
++            updatedAt: Date.now(),
++          },
++          store,
++        );
++      });
++    },
++    discard() {
++      closed = true;
++      activeDraftIds.delete(id);
++      return enqueueDraftTask((store) => deleteDraftRows(store, id));
++    },
++  };
++}
++
++function releaseDraftAfterSave(draftId: string | undefined): void {
++  if (!draftId) return;
++  activeDraftIds.delete(draftId);
++  void enqueueDraftTask((store) => deleteDraftRows(store, draftId));
++}
++
++function scheduleDraftRecovery(key: string, delayMs: number): void {
++  setTimeout(() => {
++    void enqueueDraftTask(async (drafts, recordings) => {
++      if (await recoverDrafts(key, drafts, recordings)) notify(key);
++    });
++  }, delayMs);
++}
++
++async function recoverDrafts(
++  key: string,
++  drafts: UseStore,
++  recordings: UseStore | null,
++): Promise<boolean> {
++  const draftKeys = (await keys<IDBValidKey>(drafts)).filter(
++    (storedKey) =>
++      Array.isArray(storedKey) &&
++      storedKey[0] === key &&
++      typeof storedKey[1] === "string" &&
++      !activeDraftIds.has(storedKey[1]),
++  );
++  if (draftKeys.length === 0) return false;
++  const groups = new Map<string, z.infer<typeof draftStoredChunkSchema>[]>();
++  for (const row of await getMany<unknown>(draftKeys, drafts)) {
++    const parsed = draftStoredChunkSchema.safeParse(row);
++    if (!parsed.success) continue;
++    const list = groups.get(parsed.data.draftId) ?? [];
++    list.push(parsed.data);
++    groups.set(parsed.data.draftId, list);
++  }
++  let restored = false;
++  const now = Date.now();
++  for (const [draftId, rows] of groups) {
++    rows.sort((left, right) => left.seq - right.seq);
++    const newest = Math.max(...rows.map((row) => row.updatedAt));
++    if (now - newest < DRAFT_RECOVERY_MIN_AGE_MS) {
++      scheduleDraftRecovery(
++        key,
++        DRAFT_RECOVERY_MIN_AGE_MS - (now - newest) + 1_000,
++      );
++      continue;
++    }
++    const first = rows[0]!;
++    if (first.seq !== 0) {
++      await deleteDraftRows(drafts, draftId);
++      continue;
++    }
++    const extension = first.mimeType.includes("ogg")
++      ? "ogg"
++      : first.mimeType.includes("mp4")
++        ? "mp4"
++        : "webm";
++    const file = new File(
++      rows.map((row) => row.audio),
++      `recording.${extension}`,
++      { type: first.mimeType },
++    );
++    if (file.size > 0 && !entries.has(draftId)) {
++      const recording: VoiceRecording = {
++        id: draftId,
++        key,
++        file,
++        promptContext: first.promptContext ?? undefined,
++        delivery: "insert",
++        createdAt: first.createdAt,
++      };
++      if (recordings) {
++        await set(
++          [key, draftId],
++          {
++            id: draftId,
++            key,
++            audio: await file.arrayBuffer(),
++            mimeType: file.type,
++            fileName: file.name,
++            promptContext: first.promptContext,
++            delivery: "insert",
++            createdAt: first.createdAt,
++          } satisfies StoredRecording,
++          recordings,
++        );
++      }
++      entries.set(draftId, {
++        recording,
++        persisted: recordings !== null,
++        retryController: null,
++        status: "failed",
++        errorMessage: RECOVERED_DRAFT_MESSAGE,
++      });
++      restored = true;
++    }
++    await deleteDraftRows(drafts, draftId);
++  }
++  return restored;
++}
++
+ function notify(key: string): void {
+   snapshots.delete(key);
+   for (const listener of [...listeners]) listener();
+@@ -124,6 +313,9 @@ function hydrate(key: string): void {
+     }
+     if (restored) notify(key);
+   });
++  void enqueueDraftTask(async (drafts, recordings) => {
++    if (await recoverDrafts(key, drafts, recordings)) notify(key);
++  });
+ }
+ 
+ export function useFailedVoiceRecordings(
+@@ -142,7 +334,7 @@ export function useFailedVoiceRecordings(
+ 
+ export function saveVoiceRecording(
+   recording: Omit<VoiceRecording, "id" | "createdAt">,
+-  options: { persist: boolean },
++  options: { persist: boolean; draftId?: string },
+ ): VoiceRecording {
+   const createdAt = Date.now();
+   const saved: VoiceRecording = {
+@@ -159,8 +351,12 @@ export function saveVoiceRecording(
+   });
+   notify(saved.key);
+   if (options.persist) {
++    let durable = false;
+     void enqueueDatabaseTask(async (store) => {
+-      if (!entries.has(saved.id)) return;
++      if (!entries.has(saved.id)) {
++        durable = true;
++        return;
++      }
+       const stored: StoredRecording = {
+         id: saved.id,
+         key: saved.key,
+@@ -172,7 +368,13 @@ export function saveVoiceRecording(
+         createdAt: saved.createdAt,
+       };
+       await set([saved.key, saved.id], stored, store);
++      durable = true;
++    }).then(() => {
++      if (durable) releaseDraftAfterSave(options.draftId);
++      else if (options.draftId) activeDraftIds.delete(options.draftId);
+     });
++  } else {
++    releaseDraftAfterSave(options.draftId);
+   }
+   return saved;
+ }
